@@ -3,7 +3,7 @@
 
 [client]
 # Protocols served to clients. Names must match registered adapters
-# (currently: "openai", "anthropic").
+# (currently: "openai", "anthropic"; "gemini" is upstream-side only).
 protocols = ["openai", "anthropic"]
 
 [upstream]

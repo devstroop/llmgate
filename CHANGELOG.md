@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Gemini adapter (upstream)** — `generateContent` request/response conversion
+  (`systemInstruction`, `contents`/`parts`, `generationConfig`), including
+  `inlineData` images, `thought` thinking parts, and
+  `functionCall`/`functionResponse` tool blocks. Streaming via
+  `streamGenerateContent?alt=sse` with no `[DONE]` terminator; finish chunk
+  carries stop reason + usage. Model listing via `/v1beta/models` with
+  `models/`-prefixed ids. Protocol-native error mapping.
 - **OpenAI adapter** — `/v1/chat/completions` request/response conversion
   including tools, reasoning (`reasoning_content`/`reasoning`), and images
   (data-URI and URL sources).
@@ -42,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Adapter trait** — new `stream_conversation_url()` default method lets
+  protocols with distinct streaming endpoints (e.g. Gemini
+  `:streamGenerateContent?alt=sse`) switch URLs per request; defaults to
+  `conversation_url()`.
 - **Timeout semantics** — `upstream.timeout_ms` now bounds non-streaming
   requests (conversations + model listings). Streaming requests have no total
   timeout (bounded by the SSE protocol) so long generations are not cut off;
