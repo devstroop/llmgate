@@ -1,0 +1,43 @@
+# model-adapter example configuration.
+# Copy to config.toml and adjust. Every section is optional; defaults shown.
+
+[client]
+# Protocols served to clients. Names must match registered adapters
+# (currently: "openai", "anthropic").
+protocols = ["openai", "anthropic"]
+
+[upstream]
+# Protocol the upstream provider speaks ("openai" or "anthropic").
+protocol = "openai"
+# Provider base URL. The adapter appends its own conversation path
+# (openai: /v1/chat/completions, anthropic: /v1/messages).
+url = "https://api.example.com"
+# Authorization header sent upstream (empty = none).
+authorization = "Bearer sk-upstream-key"
+
+# Protocols that use a different auth header (e.g. Anthropic x-api-key) add
+# extra headers here instead:
+# [[upstream.extra_headers]]
+# name = "x-api-key"
+# value = "sk-ant-..."
+# Per-request timeout in milliseconds.
+timeout_ms = 60_000
+
+[models]
+# Fallback model when the resolved name is empty.
+default = ""
+# Client-requested model name -> upstream model name.
+# [models.map]
+# "gpt-4o" = "claude-3-5-sonnet"
+# Prefixes stripped from requested model names before map lookup.
+prefixes = []
+
+[server]
+host = "0.0.0.0"
+port = 5000
+
+[auth]
+# Accepted client API keys. Empty = all requests allowed. Requests must
+# present a key via `Authorization: Bearer <key>`, `api-key: <key>` or
+# `x-api-key: <key>`.
+api_keys = []
