@@ -4,9 +4,11 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
 use axum::response::Response as AxumResponse;
+use futures_util::StreamExt;
 
 use super::error::AdapterError;
-use super::registry::ProtocolRegistry;
+use super::registry::{ProtocolAdapter, ProtocolRegistry};
+use super::sse::SseFraming;
 use crate::config::Config;
 use crate::proxy;
 use crate::resolver::ModelResolver;
@@ -77,12 +79,8 @@ pub async fn handle_conversation(
         Err(e) => return error_json_response(client.serialize_error(&e)),
     };
 
-    if neutral.stream {
-        let err = AdapterError::Internal("streaming not implemented yet".to_string());
-        return error_json_response(client.serialize_error(&err));
-    }
-
     neutral.model = state.resolver.resolve(&neutral.model);
+    let stream = neutral.stream;
 
     let upstream_body = match upstream.serialize_request(&neutral) {
         Ok(s) => s,
@@ -111,6 +109,10 @@ pub async fn handle_conversation(
             return error_json_response(client.serialize_error(&err));
         }
     };
+
+    if stream {
+        return handle_streaming_response(client, upstream, resp).await;
+    }
 
     let status = resp.status();
     let resp_text = match resp.text().await {
@@ -171,4 +173,118 @@ fn error_json_response((status, body): (u16, String)) -> AxumResponse {
         .header("content-type", "application/json")
         .body(Body::from(body))
         .unwrap()
+}
+
+/// Relay a streaming upstream response, converting SSE chunks on the fly:
+/// upstream SSE → `StreamDecoder` → neutral events → `StreamEncoder` →
+/// client SSE lines.
+async fn handle_streaming_response(
+    client: Arc<dyn ProtocolAdapter>,
+    upstream: Arc<dyn ProtocolAdapter>,
+    resp: reqwest::Response,
+) -> AxumResponse {
+    let status = resp.status();
+    if !status.is_success() {
+        let resp_text = match resp.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                let err = AdapterError::Internal(format!("failed to read upstream body: {e}"));
+                return error_json_response(client.serialize_error(&err));
+            }
+        };
+        let err = upstream.parse_upstream_error(status.as_u16(), &resp_text);
+        return error_json_response(client.serialize_error(&err));
+    }
+
+    let upstream_stream = resp.bytes_stream();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(64);
+
+    tokio::spawn(async move {
+        let mut framing = SseFraming::new();
+        let mut decoder = upstream.stream_decoder();
+        let mut encoder = client.stream_encoder();
+
+        let mut running = true;
+        let mut stream = Box::pin(upstream_stream);
+        while running {
+            let chunk = stream.next().await;
+            match chunk {
+                Some(Ok(bytes)) => {
+                    for payload in framing.push(&bytes) {
+                        if payload == "[DONE]" {
+                            running = false;
+                            break;
+                        }
+                        if !process_payload(&payload, &mut *decoder, &mut *encoder, &tx).await {
+                            running = false;
+                            break;
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    tracing::warn!("upstream stream error: {e}");
+                    let events = decoder.finish();
+                    for event in events {
+                        if !send_lines(encoder.encode(event), &tx).await {
+                            break;
+                        }
+                    }
+                    running = false;
+                }
+                None => {
+                    running = false;
+                }
+            }
+        }
+
+        if !tx.is_closed() {
+            for payload in framing.finish() {
+                if !process_payload(&payload, &mut *decoder, &mut *encoder, &tx).await {
+                    break;
+                }
+            }
+            for event in decoder.finish() {
+                if !send_lines(encoder.encode(event), &tx).await {
+                    break;
+                }
+            }
+            let _ = tx.send(Ok(axum::body::Bytes::from(encoder.done()))).await;
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .unwrap()
+}
+
+/// Feed one SSE payload through the decoder, encoding resulting events for
+/// the client. Returns false if the client went away.
+async fn process_payload(
+    payload: &str,
+    decoder: &mut dyn crate::core::registry::StreamDecoder,
+    encoder: &mut dyn crate::core::registry::StreamEncoder,
+    tx: &tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>,
+) -> bool {
+    for event in decoder.feed(payload) {
+        if !send_lines(encoder.encode(event), tx).await {
+            return false;
+        }
+    }
+    true
+}
+
+async fn send_lines(
+    lines: Vec<String>,
+    tx: &tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>,
+) -> bool {
+    if lines.is_empty() {
+        return true;
+    }
+    let joined = lines.join("");
+    tx.send(Ok(axum::body::Bytes::from(joined))).await.is_ok()
 }

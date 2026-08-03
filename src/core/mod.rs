@@ -4,6 +4,7 @@ pub mod error;
 pub mod neutral;
 pub mod pipeline;
 pub mod registry;
+pub mod sse;
 
 pub use error::AdapterError;
 pub use neutral::{

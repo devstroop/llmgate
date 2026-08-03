@@ -19,10 +19,12 @@ pub async fn forward(
     req.send().await
 }
 
-/// Build the HTTP client used for all upstream traffic.
-pub fn client(timeout: Duration) -> reqwest::Client {
+/// Build the HTTP client used for all upstream traffic. Only a connect
+/// timeout is applied — total request time is unbounded so long-lived SSE
+/// streams are not cut off.
+pub fn client(_timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()
-        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(10))
         .build()
         .expect("failed to build http client")
 }

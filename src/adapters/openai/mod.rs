@@ -4,6 +4,7 @@
 //! neutral model, both request and response directions.
 
 mod convert;
+mod stream;
 
 use std::sync::Arc;
 
@@ -14,6 +15,7 @@ use crate::core::registry::{EndpointKind, ProtocolAdapter, StreamDecoder, Stream
 pub use convert::{
     parse_request, parse_response, serialize_error, serialize_request, serialize_response,
 };
+pub use stream::{OpenAiStreamDecoder, OpenAiStreamEncoder};
 
 /// OpenAI chat-completions protocol adapter.
 pub struct OpenAiAdapter;
@@ -58,31 +60,11 @@ impl ProtocolAdapter for OpenAiAdapter {
     }
 
     fn stream_decoder(&self) -> Box<dyn StreamDecoder> {
-        // Streaming lands in M4.
-        Box::new(UnimplementedDecoder)
+        Box::new(OpenAiStreamDecoder::new())
     }
 
     fn stream_encoder(&self) -> Box<dyn StreamEncoder> {
-        Box::new(UnimplementedEncoder)
-    }
-}
-
-pub struct UnimplementedDecoder;
-
-impl StreamDecoder for UnimplementedDecoder {
-    fn feed(&mut self, _data: &str) -> Vec<crate::core::neutral::NeutralStreamEvent> {
-        Vec::new()
-    }
-}
-
-pub struct UnimplementedEncoder;
-
-impl StreamEncoder for UnimplementedEncoder {
-    fn encode(&mut self, _event: crate::core::neutral::NeutralStreamEvent) -> Vec<String> {
-        Vec::new()
-    }
-    fn done(&self) -> String {
-        String::new()
+        Box::new(OpenAiStreamEncoder::new())
     }
 }
 
