@@ -87,7 +87,11 @@ pub async fn handle_conversation(
         Err(e) => return error_json_response(client.serialize_error(&e)),
     };
 
-    let url = upstream.conversation_url(&state.config.upstream.url, &neutral.model);
+    let url = if stream {
+        upstream.stream_conversation_url(&state.config.upstream.url, &neutral.model)
+    } else {
+        upstream.conversation_url(&state.config.upstream.url, &neutral.model)
+    };
     let mut headers: Vec<(String, String)> = Vec::new();
     if !state.config.upstream.authorization.is_empty() {
         headers.push((
