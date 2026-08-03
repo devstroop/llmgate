@@ -44,9 +44,21 @@ pub struct UpstreamConfig {
     /// appends its own conversation path.
     pub url: String,
     /// `Authorization` header value sent upstream. Empty = no header.
+    /// For protocols that use a different auth header (e.g. Anthropic's
+    /// `x-api-key`), use `extra_headers` instead.
     pub authorization: String,
+    /// Additional headers sent on every upstream request, e.g.
+    /// `[{name = "x-api-key", value = "..."}]`.
+    pub extra_headers: Vec<Header>,
     /// Per-request timeout in milliseconds.
     pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Header {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -79,6 +91,7 @@ impl Default for Config {
                 protocol: "openai".to_string(),
                 url: "http://localhost:11434".to_string(),
                 authorization: String::new(),
+                extra_headers: Vec::new(),
                 timeout_ms: DEFAULT_TIMEOUT_MS,
             },
             models: ModelsConfig {
@@ -108,6 +121,7 @@ impl Default for UpstreamConfig {
             protocol: "openai".to_string(),
             url: "http://localhost:11434".to_string(),
             authorization: String::new(),
+            extra_headers: Vec::new(),
             timeout_ms: DEFAULT_TIMEOUT_MS,
         }
     }

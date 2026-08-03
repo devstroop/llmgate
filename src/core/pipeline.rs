@@ -90,15 +90,21 @@ pub async fn handle_conversation(
     };
 
     let url = upstream.conversation_url(&state.config.upstream.url, &neutral.model);
-    let resp = match proxy::forward(
-        &state.http,
-        &url,
-        &upstream.request_headers(),
-        &state.config.upstream.authorization,
-        &upstream_body,
-    )
-    .await
-    {
+    let mut headers: Vec<(String, String)> = Vec::new();
+    if !state.config.upstream.authorization.is_empty() {
+        headers.push((
+            "authorization".to_string(),
+            state.config.upstream.authorization.clone(),
+        ));
+    }
+    for h in &state.config.upstream.extra_headers {
+        if !h.name.is_empty() {
+            headers.push((h.name.clone(), h.value.clone()));
+        }
+    }
+    headers.extend(upstream.request_headers());
+
+    let resp = match proxy::forward(&state.http, &url, &headers, &upstream_body).await {
         Ok(r) => r,
         Err(e) => {
             let err = AdapterError::Internal(format!("upstream request failed: {e}"));

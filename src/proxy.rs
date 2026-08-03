@@ -1,21 +1,19 @@
 use std::time::Duration;
 
-/// Forward a JSON body to the upstream conversation endpoint.
+/// Forward a JSON body to the upstream conversation endpoint with the given
+/// headers (already merged by the caller: authorization + configured extra
+/// headers + protocol headers).
 pub async fn forward(
     http: &reqwest::Client,
     url: &str,
-    protocol_headers: &[(String, String)],
-    authorization: &str,
+    headers: &[(String, String)],
     body: &str,
 ) -> Result<reqwest::Response, reqwest::Error> {
     let mut req = http
         .post(url)
         .header("content-type", "application/json")
         .body(body.to_string());
-    if !authorization.is_empty() {
-        req = req.header("authorization", authorization);
-    }
-    for (key, value) in protocol_headers {
+    for (key, value) in headers {
         req = req.header(key, value);
     }
     req.send().await
