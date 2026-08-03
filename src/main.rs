@@ -28,6 +28,7 @@ async fn main() -> anyhow::Result<()> {
     let mut registry = model_adapter::core::ProtocolRegistry::new();
     registry.register(model_adapter::adapters::openai::adapter());
     registry.register(model_adapter::adapters::anthropic::adapter());
+    registry.register(model_adapter::adapters::gemini::adapter());
     state.registry = registry;
     let state = Arc::new(state);
 

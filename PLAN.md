@@ -83,7 +83,8 @@ model-adapter/
     └── adapters/
         ├── mod.rs          # registry impl, adapter wiring
         ├── openai/         # request/response serde, stream decoder+encoder, error map
-        └── anthropic/      # request/response serde, stream decoder+encoder, error map
+        ├── anthropic/      # request/response serde, stream decoder+encoder, error map
+        └── gemini/         # generateContent serde, stream decoder+encoder, error map
 ```
 
 Unit tests live inline as `#[cfg(test)] mod tests` in each module — there is no
@@ -118,6 +119,7 @@ Work in `src/adapters/*/` — the tables below live inside each adapter, not the
 | M5 | Service polish | Done. Auth middleware, `/v1/models` (per-protocol shapes), `/v1/messages/count_tokens`, route dedup. |
 | M6 | Docs & hardening | Done. README + "adding a protocol" guide, config.example.toml, curl examples, clippy clean. |
 | M7 | Reliability hardening | Done. Spec-faithful thinking blocks, timeout split, SSE keep-alive + proxy headers, bounded SSE buffering, constant-time auth, request-id tracing, JSON-as-stream fallback. |
+| M8 | gemini adapter | Done. Upstream-side `generateContent` adapter: request/response conversion (tools, thinking, images), SSE stream decoder/encoder, error mapping, model listing, `streamGenerateContent` URL switching. |
 
 ### M1 details
 
@@ -160,10 +162,35 @@ Brings the runtime in line with community/upstream standards:
   despite `stream: true` (some OpenAI-compatible servers ignore the flag), the
   body is converted into a single-event stream instead of an empty stream.
 
+### M8 details (gemini adapter)
+
+Upstream-side Gemini (`generateContent`) support. OpenAI/Anthropic clients can
+now be routed to a Gemini provider:
+
+- **Conversion** — `contents`/`systemInstruction`/`generationConfig` ↔ neutral
+  request; `candidates`/`finishReason`/`usageMetadata` ↔ neutral response.
+  Parts cover text, images (`inlineData`), thinking (`thought: true`),
+  `functionCall` ↔ tool use, and `functionResponse` ↔ tool results.
+- **Streaming** — `:streamGenerateContent?alt=sse` chunks decoded to neutral
+  events (text/reasoning/tool deltas, finish + usage) and encoded back;
+  no `[DONE]` terminator (protocol ends on finish chunk / connection close).
+- **URL switching** — new `stream_conversation_url()` default method on the
+  adapter trait (falls back to `conversation_url`); the pipeline selects the
+  streaming variant when the client requested a stream.
+- **Errors** — `{"error": {code, message, status}}` shape; HTTP status mapped
+  to the neutral taxonomy (400→invalid, 401→auth, 403→denied, 429→rate limit,
+  503→overloaded).
+- **Models** — `/v1beta/models` with the `models/`-prefixed id scheme and
+  `displayName`; re-serialized per client protocol.
+- Client-side Gemini inbound (`/v1beta/models/{model}:generateContent` needs
+  path-parameterized routing) is a follow-up milestone; this adapter serves as
+  an upstream only for now.
+
 ## Verification
 
-- `cargo test` — 53 unit tests: per-adapter conversion/stream tests + core
-  (sse framing incl. buffer cap, auth incl. constant-time, config, resolver).
+- `cargo test` — 68 unit tests: per-adapter conversion/stream tests (openai,
+  anthropic, gemini) + core (sse framing incl. buffer cap, auth incl.
+  constant-time, config, resolver).
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo fmt --check`
 - Manual curl smoke tests for both protocols (stream + non-stream, tools,
