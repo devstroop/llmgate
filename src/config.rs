@@ -27,6 +27,17 @@ pub struct Config {
     pub models: ModelsConfig,
     /// HTTP server settings.
     pub server: ServerConfig,
+    /// Client request authentication.
+    pub auth: AuthConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct AuthConfig {
+    /// Accepted client API keys. Empty = all requests allowed. Requests must
+    /// present a key via `Authorization: Bearer <key>`, `api-key: <key>` or
+    /// `x-api-key: <key>`.
+    pub api_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -102,6 +113,9 @@ impl Default for Config {
             server: ServerConfig {
                 host: DEFAULT_HOST.to_string(),
                 port: DEFAULT_PORT,
+            },
+            auth: AuthConfig {
+                api_keys: Vec::new(),
             },
         }
     }

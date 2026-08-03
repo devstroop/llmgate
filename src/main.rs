@@ -4,12 +4,14 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
+use axum::middleware;
 use axum::routing::{get, post};
 use tokio::net::TcpListener;
 
+use model_adapter::auth::require_auth;
 use model_adapter::config::Config;
-use model_adapter::core::AppState;
-use model_adapter::core::pipeline::handle_conversation;
+use model_adapter::core::pipeline::{handle_conversation, handle_count_tokens, handle_models};
+use model_adapter::core::{AppState, EndpointKind};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -44,22 +46,52 @@ async fn main() -> anyhow::Result<()> {
     let mut app = Router::<Arc<AppState>>::new().route("/health", get(health));
 
     let adapters = state.registry.client_adapters(&config.client.protocols);
+    let mut mounted: std::collections::HashSet<String> = std::collections::HashSet::new();
     for adapter in adapters {
-        for (path, _kind) in adapter.endpoints() {
+        for (path, kind) in adapter.endpoints() {
+            if !mounted.insert(path.to_string()) {
+                tracing::warn!(
+                    "skipping duplicate endpoint {} (already mounted for another protocol)",
+                    path
+                );
+                continue;
+            }
             let client_name = adapter.name().to_string();
-            let handler = move |State(state): State<Arc<AppState>>, request: Request<Body>| {
-                handle_conversation(state, client_name.clone(), request)
+            let handler = match kind {
+                EndpointKind::Models => {
+                    let client_name = client_name.clone();
+                    get(move |State(state): State<Arc<AppState>>| {
+                        handle_models(state, client_name.clone())
+                    })
+                }
+                EndpointKind::CountTokens => {
+                    let client_name = client_name.clone();
+                    post(
+                        move |State(state): State<Arc<AppState>>, request: Request<Body>| {
+                            handle_count_tokens(state, client_name.clone(), request)
+                        },
+                    )
+                }
+                EndpointKind::Chat | EndpointKind::Messages => {
+                    let client_name = client_name.clone();
+                    post(
+                        move |State(state): State<Arc<AppState>>, request: Request<Body>| {
+                            handle_conversation(state, client_name.clone(), request)
+                        },
+                    )
+                }
             };
             tracing::info!(
-                "serving {} endpoint {} (kind: {:?})",
+                "serving {} endpoint {} (kind: {kind:?})",
                 adapter.name(),
-                path,
-                _kind
+                path
             );
-            app = app.route(path, post(handler));
+            app = app.route(path, handler);
         }
     }
-    let app = app.with_state(state);
+    let app = app
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        .with_state(state);
 
     let addr = (config.server.host.as_str(), config.server.port);
     let listener = TcpListener::bind(addr).await?;

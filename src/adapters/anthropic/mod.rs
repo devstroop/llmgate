@@ -8,8 +8,10 @@ mod stream;
 
 use std::sync::Arc;
 
+use serde_json::{Value, json};
+
 use crate::core::error::AdapterError;
-use crate::core::neutral::{NeutralRequest, NeutralResponse};
+use crate::core::neutral::{ModelInfo, NeutralRequest, NeutralResponse};
 use crate::core::registry::{EndpointKind, ProtocolAdapter, StreamDecoder, StreamEncoder};
 
 pub use convert::{
@@ -32,11 +34,60 @@ impl ProtocolAdapter for AnthropicAdapter {
     }
 
     fn endpoints(&self) -> Vec<(&'static str, EndpointKind)> {
-        vec![("/v1/messages", EndpointKind::Messages)]
+        vec![
+            ("/v1/messages", EndpointKind::Messages),
+            ("/v1/messages/count_tokens", EndpointKind::CountTokens),
+            ("/v1/models", EndpointKind::Models),
+        ]
     }
 
     fn conversation_url(&self, base: &str, _model: &str) -> String {
         format!("{}/v1/messages", base.trim_end_matches('/'))
+    }
+
+    fn models_path(&self) -> Option<&'static str> {
+        Some("/v1/models")
+    }
+
+    fn parse_models(&self, body: &str) -> Result<Vec<ModelInfo>, AdapterError> {
+        let root: Value = serde_json::from_str(body)
+            .map_err(|e| AdapterError::InvalidRequest(format!("invalid JSON: {e}")))?;
+        let data = root
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AdapterError::InvalidRequest("expected a data array".to_string()))?;
+        let models = data
+            .iter()
+            .filter_map(|m| {
+                let id = m.get("id")?.as_str()?.to_string();
+                Some(ModelInfo {
+                    owned_by: m
+                        .get("display_name")
+                        .or_else(|| m.get("owner"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    id,
+                })
+            })
+            .collect();
+        Ok(models)
+    }
+
+    fn serialize_models(&self, models: &[ModelInfo]) -> Result<String, AdapterError> {
+        let data: Vec<Value> = models
+            .iter()
+            .map(|m| {
+                json!({
+                    "type": "model",
+                    "id": m.id,
+                    "display_name": m.owned_by,
+                    "created_at": "1970-01-01T00:00:00Z",
+                })
+            })
+            .collect();
+        serde_json::to_string(&json!({ "data": data }))
+            .map_err(|e| AdapterError::Internal(e.to_string()))
     }
 
     fn request_headers(&self) -> Vec<(String, String)> {

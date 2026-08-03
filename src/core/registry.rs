@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use serde_json::Value;
+
 use super::error::AdapterError;
-use super::neutral::{NeutralRequest, NeutralResponse, NeutralStreamEvent};
+use super::neutral::{ModelInfo, NeutralRequest, NeutralResponse, NeutralStreamEvent};
 
 /// What kind of conversation endpoint an inbound path represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,6 +13,10 @@ pub enum EndpointKind {
     Chat,
     /// Anthropic-style messages.
     Messages,
+    /// Model listing.
+    Models,
+    /// Token counting (e.g. Anthropic `/v1/messages/count_tokens`).
+    CountTokens,
 }
 
 /// Stateful decoder: upstream SSE line (the JSON payload after `data: `) →
@@ -53,6 +59,41 @@ pub trait ProtocolAdapter: Send + Sync {
     fn request_headers(&self) -> Vec<(String, String)> {
         Vec::new()
     }
+
+    /// Upstream path of this protocol's model listing, if it has one.
+    fn models_path(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Parse an upstream model listing into neutral model info. The default
+    /// handles the common `{"data": [{"id": ..., "owned_by": ...}]}`
+    /// shape.
+    fn parse_models(&self, body: &str) -> Result<Vec<ModelInfo>, AdapterError> {
+        let root: Value = serde_json::from_str(body)
+            .map_err(|e| AdapterError::InvalidRequest(format!("invalid JSON: {e}")))?;
+        let data = root
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AdapterError::InvalidRequest("expected a data array".to_string()))?;
+        let models = data
+            .iter()
+            .filter_map(|m| {
+                let id = m.get("id")?.as_str()?.to_string();
+                Some(ModelInfo {
+                    id,
+                    owned_by: m
+                        .get("owned_by")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                })
+            })
+            .collect();
+        Ok(models)
+    }
+
+    /// Serialize a neutral model list into this protocol's native shape.
+    fn serialize_models(&self, models: &[ModelInfo]) -> Result<String, AdapterError>;
 
     fn parse_request(&self, body: &str) -> Result<NeutralRequest, AdapterError>;
     fn serialize_request(&self, req: &NeutralRequest) -> Result<String, AdapterError>;
@@ -159,6 +200,10 @@ mod tests {
         }
         fn serialize_error(&self, err: &AdapterError) -> (u16, String) {
             (500, format!("{{\"error\": \"{err}\"}}"))
+        }
+        fn serialize_models(&self, models: &[ModelInfo]) -> Result<String, AdapterError> {
+            let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
+            Ok(serde_json::json!({ "data": ids }).to_string())
         }
         fn stream_decoder(&self) -> Box<dyn StreamDecoder> {
             Box::new(NoopDecoder)

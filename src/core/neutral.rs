@@ -135,6 +135,13 @@ pub struct NeutralUsage {
     pub output_tokens: u64,
 }
 
+/// A model as reported by the upstream provider's model list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelInfo {
+    pub id: String,
+    pub owned_by: String,
+}
+
 /// Neutral streaming events produced by a [`super::registry::StreamDecoder`]
 /// and consumed by a [`super::registry::StreamEncoder`].
 #[derive(Debug, Clone, PartialEq)]

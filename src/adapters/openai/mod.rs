@@ -8,8 +8,10 @@ mod stream;
 
 use std::sync::Arc;
 
+use serde_json::{Value, json};
+
 use crate::core::error::AdapterError;
-use crate::core::neutral::{NeutralRequest, NeutralResponse};
+use crate::core::neutral::{ModelInfo, NeutralRequest, NeutralResponse};
 use crate::core::registry::{EndpointKind, ProtocolAdapter, StreamDecoder, StreamEncoder};
 
 pub use convert::{
@@ -32,11 +34,34 @@ impl ProtocolAdapter for OpenAiAdapter {
     }
 
     fn endpoints(&self) -> Vec<(&'static str, EndpointKind)> {
-        vec![("/v1/chat/completions", EndpointKind::Chat)]
+        vec![
+            ("/v1/chat/completions", EndpointKind::Chat),
+            ("/v1/models", EndpointKind::Models),
+        ]
     }
 
     fn conversation_url(&self, base: &str, _model: &str) -> String {
         format!("{}/v1/chat/completions", base.trim_end_matches('/'))
+    }
+
+    fn models_path(&self) -> Option<&'static str> {
+        Some("/v1/models")
+    }
+
+    fn serialize_models(&self, models: &[ModelInfo]) -> Result<String, AdapterError> {
+        let data: Vec<Value> = models
+            .iter()
+            .map(|m| {
+                json!({
+                    "id": m.id,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": m.owned_by,
+                })
+            })
+            .collect();
+        serde_json::to_string(&json!({ "object": "list", "data": data }))
+            .map_err(|e| AdapterError::Internal(e.to_string()))
     }
 
     fn parse_request(&self, body: &str) -> Result<NeutralRequest, AdapterError> {

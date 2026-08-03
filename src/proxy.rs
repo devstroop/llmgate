@@ -19,6 +19,19 @@ pub async fn forward(
     req.send().await
 }
 
+/// GET an upstream endpoint (used for model listings).
+pub async fn forward_get(
+    http: &reqwest::Client,
+    url: &str,
+    headers: &[(String, String)],
+) -> Result<reqwest::Response, reqwest::Error> {
+    let mut req = http.get(url);
+    for (key, value) in headers {
+        req = req.header(key, value);
+    }
+    req.send().await
+}
+
 /// Build the HTTP client used for all upstream traffic. Only a connect
 /// timeout is applied — total request time is unbounded so long-lived SSE
 /// streams are not cut off.

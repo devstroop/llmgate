@@ -154,6 +154,132 @@ async fn read_body(request: Request<Body>) -> Result<String, AdapterError> {
         .map_err(|_| AdapterError::InvalidRequest("body is not valid utf-8".to_string()))
 }
 
+/// Generic model-listing handler. Fetches the upstream model list, parses it
+/// with the upstream adapter, and re-serializes it in the client protocol's
+/// native shape.
+pub async fn handle_models(state: Arc<AppState>, client_name: String) -> AxumResponse {
+    let client = match state.registry.get(&client_name) {
+        Some(a) => a,
+        None => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("client protocol not registered: {client_name}"),
+            );
+        }
+    };
+    let upstream = match state.registry.get(&state.config.upstream.protocol) {
+        Some(a) => a,
+        None => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!(
+                    "upstream protocol not registered: {}",
+                    state.config.upstream.protocol
+                ),
+            );
+        }
+    };
+    let Some(models_path) = upstream.models_path() else {
+        let err = AdapterError::Internal(format!(
+            "upstream protocol {} has no model listing",
+            upstream.name()
+        ));
+        return error_json_response(client.serialize_error(&err));
+    };
+
+    let url = format!(
+        "{}{}",
+        state.config.upstream.url.trim_end_matches('/'),
+        models_path
+    );
+    let mut headers: Vec<(String, String)> = Vec::new();
+    if !state.config.upstream.authorization.is_empty() {
+        headers.push((
+            "authorization".to_string(),
+            state.config.upstream.authorization.clone(),
+        ));
+    }
+    for h in &state.config.upstream.extra_headers {
+        if !h.name.is_empty() {
+            headers.push((h.name.clone(), h.value.clone()));
+        }
+    }
+    headers.extend(upstream.request_headers());
+
+    let resp = match proxy::forward_get(&state.http, &url, &headers).await {
+        Ok(r) => r,
+        Err(e) => {
+            let err = AdapterError::Internal(format!("upstream request failed: {e}"));
+            return error_json_response(client.serialize_error(&err));
+        }
+    };
+
+    let status = resp.status();
+    let resp_text = match resp.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            let err = AdapterError::Internal(format!("failed to read upstream body: {e}"));
+            return error_json_response(client.serialize_error(&err));
+        }
+    };
+    if !status.is_success() {
+        let err = upstream.parse_upstream_error(status.as_u16(), &resp_text);
+        return error_json_response(client.serialize_error(&err));
+    }
+
+    let models = match upstream.parse_models(&resp_text) {
+        Ok(m) => m,
+        Err(e) => return error_json_response(client.serialize_error(&e)),
+    };
+    let body = match client.serialize_models(&models) {
+        Ok(b) => b,
+        Err(e) => return error_json_response(client.serialize_error(&e)),
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// Generic token-counting handler. Estimates input tokens from the request
+/// body using a heuristic and returns the estimate in the client protocol's
+/// shape (Anthropic: `{"input_tokens": N}`).
+pub async fn handle_count_tokens(
+    state: Arc<AppState>,
+    client_name: String,
+    request: Request<Body>,
+) -> AxumResponse {
+    let client = match state.registry.get(&client_name) {
+        Some(a) => a,
+        None => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("client protocol not registered: {client_name}"),
+            );
+        }
+    };
+    let body = match read_body(request).await {
+        Ok(b) => b,
+        Err(e) => return error_json_response(client.serialize_error(&e)),
+    };
+    let estimated = estimate_tokens(&body);
+    let response_body = serde_json::json!({ "input_tokens": estimated }).to_string();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(response_body))
+        .unwrap()
+}
+
+/// Heuristic token estimate: chars/4 + words/8.
+pub fn estimate_tokens(text: &str) -> u64 {
+    let chars = text.chars().count() as u64;
+    let words = text.split_whitespace().count() as u64;
+    chars / 4 + words / 8
+}
+
 fn error_response(status: StatusCode, message: &str) -> AxumResponse {
     Response::builder()
         .status(status)
