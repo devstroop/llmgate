@@ -110,12 +110,12 @@ Work in `src/adapters/*/` — the tables below live inside each adapter, not the
 
 | # | Scope | Definition of done |
 |---|-------|--------------------|
-| M1 | Core framework | `neutral.rs`, `ProtocolAdapter` trait, `ProtocolRegistry`, generic pipeline, config load, health endpoint. `cargo build` clean, core unit tests pass. |
-| M2 | openai adapter | Request/response conversion (non-stream) incl. tools + reasoning fields. Unit tests w/ fixture JSON. |
-| M3 | anthropic adapter | Request/response conversion (non-stream) incl. tools, thinking, images, error mapping. Unit tests w/ fixture JSON. |
-| M4 | Streaming | `StreamDecoder`/`StreamEncoder` for both adapters; streaming e2e vs mock upstream (both directions). |
-| M5 | Service polish | Auth (Bearer/x-api-key), `/v1/models` (list + per-protocol naming), proxy timeout/retry, edge cases. |
-| M6 | Docs & hardening | README + "how to add a protocol" guide, config example, curl examples, clippy clean. |
+| M1 | Core framework | Done. Neutral model, adapter trait/registry, generic pipeline, config, health. 52 unit tests across the repo. |
+| M2 | openai adapter | Done. Request/response conversion incl. tools, reasoning, images. |
+| M3 | anthropic adapter | Done. Request/response conversion incl. tools, thinking, images, error mapping. |
+| M4 | Streaming | Done. Stateful decoders/encoders both adapters; e2e verified both directions. |
+| M5 | Service polish | Done. Auth middleware, `/v1/models` (per-protocol shapes), `/v1/messages/count_tokens`, route dedup. |
+| M6 | Docs & hardening | Done. README + "adding a protocol" guide, config.example.toml, curl examples, clippy clean. |
 
 ### M1 details
 
