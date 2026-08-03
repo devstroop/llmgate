@@ -49,7 +49,7 @@ mod tests {
         ModelResolver::new(
             "fallback-model".to_string(),
             map,
-            vec!["@cm/".to_string(), "gateway/".to_string()],
+            vec!["vendor/".to_string(), "gateway/".to_string()],
         )
     }
 
@@ -60,7 +60,7 @@ mod tests {
 
     #[test]
     fn strips_prefix_before_map() {
-        assert_eq!(resolver().resolve("@cm/gpt-4o"), "claude-3-5-sonnet");
+        assert_eq!(resolver().resolve("vendor/gpt-4o"), "claude-3-5-sonnet");
     }
 
     #[test]
@@ -75,7 +75,7 @@ mod tests {
 
     #[test]
     fn empty_uses_default() {
-        assert_eq!(resolver().resolve("@cm/"), "fallback-model");
+        assert_eq!(resolver().resolve("vendor/"), "fallback-model");
         assert_eq!(resolver().resolve(""), "fallback-model");
     }
 }

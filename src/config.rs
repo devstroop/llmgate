@@ -154,7 +154,7 @@ timeout_ms = 30_000
 
 [models]
 default = "claude-3-5-sonnet"
-prefixes = ["@cm/"]
+prefixes = ["gateway/"]
 [models.map]
 "gpt-4o" = "claude-3-5-sonnet"
 "#;

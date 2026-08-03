@@ -22,10 +22,9 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::load()?;
     let mut state = AppState::new(config.clone());
 
-    // Adapters are registered here as they land (M2: openai, M3: anthropic).
-    let registry = model_adapter::core::ProtocolRegistry::new();
-    // registry.register(Arc::new(model_adapter::adapters::openai::OpenAiAdapter::default()));
-    // registry.register(Arc::new(model_adapter::adapters::anthropic::AnthropicAdapter::default()));
+    // Adapters are registered here as they land (M3: anthropic).
+    let mut registry = model_adapter::core::ProtocolRegistry::new();
+    registry.register(model_adapter::adapters::openai::adapter());
     state.registry = registry;
     let state = Arc::new(state);
 
