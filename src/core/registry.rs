@@ -54,6 +54,13 @@ pub trait ProtocolAdapter: Send + Sync {
     /// protocols (e.g. Gemini `/{model}:generateContent`).
     fn conversation_url(&self, base: &str, model: &str) -> String;
 
+    /// Upstream conversation URL for a *streaming* request. Defaults to the
+    /// non-streaming URL; protocols with a distinct streaming endpoint
+    /// (e.g. Gemini `/{model}:streamGenerateContent?alt=sse`) override this.
+    fn stream_conversation_url(&self, base: &str, model: &str) -> String {
+        self.conversation_url(base, model)
+    }
+
     /// Extra headers required by this protocol on upstream requests
     /// (e.g. `anthropic-version`).
     fn request_headers(&self) -> Vec<(String, String)> {

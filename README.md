@@ -22,6 +22,7 @@ See [PLAN.md](PLAN.md) for the full plan and
 | M5 | Auth, /v1/models, count_tokens | done |
 | M6 | Docs & hardening | done |
 | M7 | Reliability hardening (timeouts, keep-alive, request-ids, bounded buffering) | done |
+| M8 | Gemini adapter (upstream `generateContent`) | done |
 
 ## Design in one line
 
@@ -39,11 +40,15 @@ Anthropic client ──▶ /v1/messages ───────┘                
 ## Features
 
 - **Bidirectional protocol conversion** — OpenAI `chat.completions` ↔ neutral
-  ↔ Anthropic `messages`, both client- and upstream-side.
+  ↔ Anthropic `messages`, both client- and upstream-side. Gemini
+  (`generateContent`) is supported upstream-side: OpenAI/Anthropic clients can
+  be routed to a Gemini provider.
 - **SSE streaming** — chunks/events converted live in both directions,
   including thinking/reasoning blocks, tool-call deltas, and usage. The gateway
   emits its own 15s keep-alive so long streams survive proxies, and sets
-  `X-Accel-Buffering: no` to defeat intermediary buffering.
+  `X-Accel-Buffering: no` to defeat intermediary buffering. Gemini streams
+  (`streamGenerateContent?alt=sse`) relay with no `[DONE]` terminator, per the
+  protocol.
 - **Tool calling** — OpenAI `function` tools ↔ Anthropic `input_schema` tools,
   `tool_calls` ↔ `tool_use`/`tool_result` blocks.
 - **Reasoning** — `reasoning_content` ↔ `thinking` blocks (with signatures)
@@ -119,6 +124,16 @@ total timeout — the stream is bounded by the SSE protocol itself
 (`[DONE]` / `message_stop` / connection close) so long generations are not cut
 off. TCP connect timeout is a fixed 10s.
 
+### Gemini upstream
+
+Point `[upstream]` at a Gemini-compatible base URL (e.g.
+`https://generativelanguage.googleapis.com`) with `protocol = "gemini"`, and
+set the API key via `[[upstream.extra_headers]]` (`x-goog-api-key`) or
+`authorization` (`Bearer <key>`). The resolved model name becomes the URL path
+segment (`:generateContent` / `:streamGenerateContent?alt=sse`), so
+`[models.map]` entries should map client model names to Gemini model ids (e.g.
+`"gpt-4o" = "gemini-2.5-flash"`).
+
 ## Project layout
 
 ```
@@ -136,7 +151,8 @@ src/
 │   └── sse.rs         # SSE framing parser (bounded buffering)
 └── adapters/
     ├── openai/        # convert.rs + stream.rs
-    └── anthropic/     # convert.rs + stream.rs
+    ├── anthropic/     # convert.rs + stream.rs
+    └── gemini/        # convert.rs + stream.rs (upstream-side generateContent)
 ```
 
 Unit tests are inline `#[cfg(test)]` modules; there is no separate `tests/`
@@ -174,7 +190,7 @@ protocol-specific fragments (e.g. tool-call arguments) themselves.
 ## Verification
 
 ```bash
-cargo test        # 53 unit tests: converters, streams, sse, auth, config, resolver
+cargo test        # 68 unit tests: converters, streams, sse, auth, config, resolver
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
