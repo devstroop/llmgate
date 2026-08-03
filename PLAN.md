@@ -68,25 +68,26 @@ model-adapter/
 ├── config.example.toml
 ├── PLAN.md
 ├── README.md
-├── src/
-│   ├── main.rs             # bootstrap, registry assembly, router, shutdown
-│   ├── config.rs           # TOML + env overrides
-│   ├── auth.rs             # per-protocol auth extraction (Bearer / x-api-key)
-│   ├── resolver.rs         # model pipeline (agnostic)
-│   ├── core/               # protocol-agnostic core
-│   │   ├── mod.rs          # trait definitions, registry, pipeline orchestration
-│   │   ├── neutral.rs      # NeutralRequest / NeutralResponse / NeutralStreamEvent
-│   │   ├── pipeline.rs     # generic handler: parse -> resolve -> forward -> convert back
-│   │   └── error.rs        # AdapterError (rate_limit, auth, overloaded, quota, api, ...)
-│   ├── adapters/
-│   │   ├── mod.rs          # registry impl, adapter wiring
-│   │   ├── openai/         # request/response serde, stream decoder+encoder, error map
-│   │   └── anthropic/      # request/response serde, stream decoder+encoder, error map
-│   └── proxy.rs            # reqwest forwarding (streaming + non-streaming)
-└── tests/
-    ├── converters.rs       # per-adapter unit tests w/ fixture JSON
-    └── integration.rs      # mock-upstream e2e: openai <-> anthropic, both directions
+└── src/
+    ├── main.rs             # bootstrap, registry assembly, router, shutdown, request-id tracing
+    ├── config.rs           # TOML + env overrides
+    ├── auth.rs             # per-protocol auth extraction (Bearer / api-key / x-api-key), constant-time
+    ├── resolver.rs         # model pipeline (agnostic)
+    ├── proxy.rs            # reqwest forwarding (streaming + non-streaming, timeout split)
+    ├── core/               # protocol-agnostic core
+    │   ├── mod.rs          # trait definitions, registry, pipeline orchestration
+    │   ├── neutral.rs      # NeutralRequest / NeutralResponse / NeutralStreamEvent
+    │   ├── pipeline.rs     # generic handler: parse -> resolve -> forward -> convert back
+    │   ├── error.rs        # AdapterError (rate_limit, auth, overloaded, quota, api, ...)
+    │   └── sse.rs          # SSE framing parser with bounded buffering
+    └── adapters/
+        ├── mod.rs          # registry impl, adapter wiring
+        ├── openai/         # request/response serde, stream decoder+encoder, error map
+        └── anthropic/      # request/response serde, stream decoder+encoder, error map
 ```
+
+Unit tests live inline as `#[cfg(test)] mod tests` in each module — there is no
+separate `tests/` directory.
 
 ## Conversion mapping notes
 
@@ -103,19 +104,20 @@ Work in `src/adapters/*/` — the tables below live inside each adapter, not the
 - **Streaming**: adapters provide a stateful `StreamDecoder` (upstream SSE →
   neutral events) and `StreamEncoder` (neutral events → client SSE lines).
   Anthropic event choreography (`message_start` → `content_block_start/delta` →
-  `signature_delta` on block switch → `message_delta` → `message_stop` → `[DONE]`)
-  is entirely inside the anthropic adapter.
+  `signature_delta` on block switch → `message_delta` → `message_stop`) is
+  entirely inside the anthropic adapter.
 
 ## Milestones
 
 | # | Scope | Definition of done |
 |---|-------|--------------------|
-| M1 | Core framework | Done. Neutral model, adapter trait/registry, generic pipeline, config, health. 52 unit tests across the repo. |
+| M1 | Core framework | Done. Neutral model, adapter trait/registry, generic pipeline, config, health. |
 | M2 | openai adapter | Done. Request/response conversion incl. tools, reasoning, images. |
 | M3 | anthropic adapter | Done. Request/response conversion incl. tools, thinking, images, error mapping. |
 | M4 | Streaming | Done. Stateful decoders/encoders both adapters; e2e verified both directions. |
 | M5 | Service polish | Done. Auth middleware, `/v1/models` (per-protocol shapes), `/v1/messages/count_tokens`, route dedup. |
 | M6 | Docs & hardening | Done. README + "adding a protocol" guide, config.example.toml, curl examples, clippy clean. |
+| M7 | Reliability hardening | Done. Spec-faithful thinking blocks, timeout split, SSE keep-alive + proxy headers, bounded SSE buffering, constant-time auth, request-id tracing, JSON-as-stream fallback. |
 
 ### M1 details
 
@@ -124,21 +126,48 @@ Work in `src/adapters/*/` — the tables below live inside each adapter, not the
 - `src/core/neutral.rs`: full neutral model types.
 - `src/core/mod.rs`: `ProtocolAdapter`, `StreamDecoder`, `StreamEncoder`,
   `ProtocolRegistry` (register + get by name), `EndpointKind` (`Chat`,
-  `Messages`, `Models`, `Health`).
-- `src/core/pipeline.rs`: `handle_chat` generic over client adapter + upstream
-  adapter — parse, resolve model, serialize for upstream, forward via
+  `Messages`, `Models`, `CountTokens`).
+- `src/core/pipeline.rs`: `handle_conversation` generic over client adapter +
+  upstream adapter — parse, resolve model, serialize for upstream, forward via
   `proxy.rs`, convert response back.
 - `src/config.rs`: TOML schema with `[client]` protocols, `[upstream]`
   protocol/url/auth, `[models]` map; env overrides.
 - `src/main.rs`: bootstrap registry from config, mount routes per client
   protocol's `endpoints()`, health at `/health`.
 
+### M7 details (reliability hardening)
+
+Brings the runtime in line with community/upstream standards:
+
+- **Thinking block shape** — Anthropic `content_block_start` for thinking
+  blocks carries a `thinking` field (not `text`), per the Anthropic streaming
+  spec; verified by a regression test.
+- **Timeout split** — `timeout_ms` is now enforced as a total per-request
+  timeout on non-streaming calls (conversation + model listing). Streaming
+  requests have no total timeout (bounded by the SSE protocol) so long
+  generations aren't cut off; connect timeout fixed at 10s.
+- **SSE keep-alive** — the gateway emits `: keepalive` comment lines on a 15s
+  idle interval so long streams (thinking, tool calls) survive proxies and
+  idle-dropping clients. `X-Accel-Buffering: no` + `Cache-Control: no-cache`
+  prevent intermediary buffering.
+- **Bounded SSE buffering** — `SseFraming` discards buffers past a 64 MiB cap
+  instead of growing unbounded on a broken/malicious upstream.
+- **Constant-time auth** — API-key comparison no longer leaks prefix/length
+  timing.
+- **Request-id correlation** — inbound `x-request-id` is honored (or generated),
+  threaded into the tracing span, and echoed on the response.
+- **JSON-as-stream fallback** — if the upstream answers `application/json`
+  despite `stream: true` (some OpenAI-compatible servers ignore the flag), the
+  body is converted into a single-event stream instead of an empty stream.
+
 ## Verification
 
-- `cargo test` — per-adapter unit tests + e2e against a local mock upstream
-  (both directions, stream + non-stream, with tools).
-- `cargo clippy -- -D warnings`
-- Manual curl for both protocols.
+- `cargo test` — 53 unit tests: per-adapter conversion/stream tests + core
+  (sse framing incl. buffer cap, auth incl. constant-time, config, resolver).
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo fmt --check`
+- Manual curl smoke tests for both protocols (stream + non-stream, tools,
+  auth, models).
 
 ## Out of scope (for now)
 

@@ -91,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let app = app
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        .layer(middleware::from_fn(request_trace))
         .with_state(state);
 
     let addr = (config.server.host.as_str(), config.server.port);
@@ -108,6 +109,46 @@ async fn health() -> (StatusCode, axum::Json<serde_json::Value>) {
         StatusCode::OK,
         axum::Json(serde_json::json!({ "status": "ok" })),
     )
+}
+
+/// Attach a request id (honour an inbound `x-request-id`, else generate one),
+/// thread it into the tracing span for correlation, and echo it back on the
+/// response.
+async fn request_trace(request: Request<Body>, next: middleware::Next) -> axum::response::Response {
+    const HEADER: &str = "x-request-id";
+    let request_id = request
+        .headers()
+        .get(HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(generate_request_id);
+
+    let span = tracing::info_span!("request", request_id = %request_id);
+    let mut response = span.in_scope(|| next.run(request)).await;
+
+    response.headers_mut().insert(
+        HEADER,
+        request_id
+            .parse()
+            .unwrap_or_else(|_| panic!("generated/inbound request id is not valid header value")),
+    );
+    response
+}
+
+/// Generate a short unique request id for correlation.
+fn generate_request_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // Derive a deterministic-ish value from the timestamp plus a process seed.
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write_u128(nanos);
+    h.write_u64(std::process::id() as u64);
+    format!("req-{:016x}", h.finish())
 }
 
 async fn shutdown_signal() {

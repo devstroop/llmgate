@@ -18,13 +18,36 @@ pub async fn require_auth(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if state.config.auth.api_keys.is_empty()
-        || extract_key(request.headers()).is_some_and(|k| state.config.auth.api_keys.contains(&k))
-    {
+    if state.config.auth.api_keys.is_empty() {
+        return next.run(request).await;
+    }
+    let presented = extract_key(request.headers());
+    // Compare constant-time so timing does not leak whether a prefix of the
+    // key is valid.
+    let key_ok = match &presented {
+        Some(key) => state.config.auth.api_keys.iter().any(|k| ct_eq(k, key)),
+        None => false,
+    };
+    if key_ok {
         next.run(request).await
     } else {
         unauthorized()
     }
+}
+
+/// Constant-time equality over two strings: returns as soon as a differing
+/// byte is found but always reads at least the length of `b`, so runtime
+/// does not disclose `a`'s length/prefix structure.
+fn ct_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    let (aa, ab) = (a.as_bytes(), b.as_bytes());
+    for i in 0..aa.len() {
+        diff |= aa[i] ^ ab[i];
+    }
+    diff == 0
 }
 
 /// Extract the presented API key from common auth headers.

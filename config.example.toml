@@ -12,15 +12,21 @@ protocol = "openai"
 # Provider base URL. The adapter appends its own conversation path
 # (openai: /v1/chat/completions, anthropic: /v1/messages).
 url = "https://api.example.com"
-# Authorization header sent upstream (empty = none).
-authorization = "Bearer sk-upstream-key"
-
+# Authorization header value sent upstream. Empty = no header.
 # Protocols that use a different auth header (e.g. Anthropic x-api-key) add
-# extra headers here instead:
+# extra headers instead (see below).
+authorization = "Bearer <your-upstream-api-key>"
+
+# Protocols that use a different auth header add extra headers here instead:
 # [[upstream.extra_headers]]
 # name = "x-api-key"
-# value = "sk-ant-..."
-# Per-request timeout in milliseconds.
+# value = "<your-upstream-api-key>"
+
+# Timeout for NON-streaming upstream requests, in milliseconds. Streaming
+# requests deliberately have no total timeout — the stream is bounded by the
+# SSE protocol itself ([DONE] / message_stop / connection close) so long
+# generations are not cut off mid-stream. The TCP connect timeout is a fixed
+# 10s regardless.
 timeout_ms = 60_000
 
 [models]
@@ -38,6 +44,6 @@ port = 5000
 
 [auth]
 # Accepted client API keys. Empty = all requests allowed. Requests must
-# present a key via `Authorization: Bearer <key>`, `api-key: <key>` or
-# `x-api-key: <key>`.
+# present a key via `Authorization: Bearer <key>`, `api-key: <key>`, or
+# `x-api-key: <key>`. Key comparison is constant-time.
 api_keys = []

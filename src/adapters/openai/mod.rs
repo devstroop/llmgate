@@ -49,13 +49,17 @@ impl ProtocolAdapter for OpenAiAdapter {
     }
 
     fn serialize_models(&self, models: &[ModelInfo]) -> Result<String, AdapterError> {
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let data: Vec<Value> = models
             .iter()
             .map(|m| {
                 json!({
                     "id": m.id,
                     "object": "model",
-                    "created": 0,
+                    "created": created,
                     "owned_by": m.owned_by,
                 })
             })

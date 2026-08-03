@@ -9,7 +9,8 @@ Ollama, Bedrock, ...) added as pluggable adapters without touching the core.
 
 ## Status
 
-All planned milestones complete. See [PLAN.md](PLAN.md) for the full plan and
+All planned milestones complete, including the M7 reliability-hardening pass.
+See [PLAN.md](PLAN.md) for the full plan and
 [the "adding a protocol" section](#adding-a-protocol) below for extending it.
 
 | Milestone | Scope | Status |
@@ -20,6 +21,7 @@ All planned milestones complete. See [PLAN.md](PLAN.md) for the full plan and
 | M4 | SSE streaming (both adapters) | done |
 | M5 | Auth, /v1/models, count_tokens | done |
 | M6 | Docs & hardening | done |
+| M7 | Reliability hardening (timeouts, keep-alive, request-ids, bounded buffering) | done |
 
 ## Design in one line
 
@@ -39,20 +41,29 @@ Anthropic client ──▶ /v1/messages ───────┘                
 - **Bidirectional protocol conversion** — OpenAI `chat.completions` ↔ neutral
   ↔ Anthropic `messages`, both client- and upstream-side.
 - **SSE streaming** — chunks/events converted live in both directions,
-  including thinking/reasoning blocks, tool-call deltas, and usage.
+  including thinking/reasoning blocks, tool-call deltas, and usage. The gateway
+  emits its own 15s keep-alive so long streams survive proxies, and sets
+  `X-Accel-Buffering: no` to defeat intermediary buffering.
 - **Tool calling** — OpenAI `function` tools ↔ Anthropic `input_schema` tools,
   `tool_calls` ↔ `tool_use`/`tool_result` blocks.
 - **Reasoning** — `reasoning_content` ↔ `thinking` blocks (with signatures)
-  in bodies and streams.
+  in bodies and streams, with spec-faithful thinking block shapes.
 - **Images** — data-URI and URL image sources both ways.
 - **Model resolution** — prefix strip → `model_map` → default, protocol-agnostic.
-- **Client auth** — optional API keys via `Authorization: Bearer`,
-  `api-key`, or `x-api-key` headers.
+- **Client auth** — optional API keys via `Authorization: Bearer <key>`,
+  `api-key: <key>`, or `x-api-key: <key>`; constant-time comparison.
+- **Request correlation** — inbound `x-request-id` is honored (or generated),
+  threaded into logs, and echoed on the response.
 - **Model listing** — `/v1/models` fetched from the upstream and re-serialized
   in the client's native shape.
 - **Token counting** — `/v1/messages/count_tokens` heuristic.
+- **JSON-as-stream fallback** — if an upstream ignores `stream: true` and
+  answers with plain JSON, the body is converted into a single-event stream
+  instead of an empty stream.
 
 ## Quick start
+
+Requirements: Rust 1.85+ (edition 2024).
 
 ```bash
 cargo build --release
@@ -87,6 +98,9 @@ curl -N -X POST http://localhost:5000/v1/chat/completions \
 
 # Models
 curl http://localhost:5000/v1/models
+
+# Health
+curl http://localhost:5000/health
 ```
 
 ## Configuration
@@ -99,25 +113,34 @@ URL, auth headers, timeout), `[models]` (default, map, prefixes), `[server]`
 `CONFIG_PATH` env var overrides the config file location (default `./config.toml`);
 if no file exists, defaults are used.
 
+Timeout semantics: `upstream.timeout_ms` (default 60s) bounds **non-streaming**
+requests (conversations and model listings). **Streaming** requests have no
+total timeout — the stream is bounded by the SSE protocol itself
+(`[DONE]` / `message_stop` / connection close) so long generations are not cut
+off. TCP connect timeout is a fixed 10s.
+
 ## Project layout
 
 ```
 src/
-├── main.rs            # bootstrap, route mounting per endpoint kind, auth layer
+├── main.rs            # bootstrap, route mounting per endpoint kind, auth + request-id layers
 ├── config.rs          # TOML config + env override
-├── auth.rs            # client API-key middleware
+├── auth.rs            # client API-key middleware (constant-time)
 ├── resolver.rs        # model resolution pipeline (prefix strip -> map -> default)
-├── proxy.rs           # upstream HTTP client + forward helpers
+├── proxy.rs           # upstream HTTP client + forward helpers (timeout split)
 ├── core/
 │   ├── neutral.rs     # protocol-neutral request/response/stream model
 │   ├── registry.rs    # ProtocolAdapter trait, StreamDecoder/Encoder, registry
-│   ├── pipeline.rs    # generic handlers (conversation, models, count_tokens)
+│   ├── pipeline.rs    # generic handlers (conversation, models, count_tokens, streaming)
 │   ├── error.rs       # protocol-independent error taxonomy
-│   └── sse.rs         # SSE framing parser
+│   └── sse.rs         # SSE framing parser (bounded buffering)
 └── adapters/
     ├── openai/        # convert.rs + stream.rs
     └── anthropic/     # convert.rs + stream.rs
 ```
+
+Unit tests are inline `#[cfg(test)]` modules; there is no separate `tests/`
+directory.
 
 ## Adding a protocol
 
@@ -151,14 +174,14 @@ protocol-specific fragments (e.g. tool-call arguments) themselves.
 ## Verification
 
 ```bash
-cargo test        # unit tests per adapter + core
+cargo test        # 53 unit tests: converters, streams, sse, auth, config, resolver
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-E2E smoke tests run against local mock upstreams (see commit messages for M3/M4
-for the exact flows verified: both directions, stream + non-stream, tools,
-auth, models).
+E2E smoke tests run manually against local mock upstreams (both directions,
+stream + non-stream, tools, auth, models — see commit messages for M3/M4 and
+the working-tree diff for M7).
 
 ## Out of scope (for now)
 

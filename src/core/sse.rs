@@ -4,6 +4,15 @@
 //! payloads: the concatenation of all `data:` lines of an event, terminated
 //! by a blank line. Comment lines (`:`), `event:`, `id:`, `retry:` fields are
 //! ignored; `[DONE]` and other payloads pass through verbatim.
+//!
+//! A cap bounds how many bytes can be buffered between line terminators so a
+//! broken or malicious upstream cannot exhaust memory with an endless
+//! unterminated line.
+
+/// Maximum bytes buffered before a newline terminator. If exceeded, the
+/// buffer is discarded to bound memory. Well-formed SSE events are many
+/// orders of magnitude smaller; this only fires on a broken/malicious peer.
+const MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Default)]
 pub struct SseFraming {
@@ -19,6 +28,15 @@ impl SseFraming {
     /// Feed bytes; returns the complete event payloads found (in order).
     pub fn push(&mut self, chunk: &[u8]) -> Vec<String> {
         self.buffer.extend_from_slice(chunk);
+
+        // Protect against unbounded buffering: if the buffer has grown past
+        // the cap without a newline terminator, discard it rather than
+        // consuming unbounded memory.
+        if self.buffer.len() > MAX_BUFFER_BYTES {
+            self.buffer.clear();
+            self.data_lines.clear();
+        }
+
         let mut payloads = Vec::new();
         while let Some(newline) = self.buffer.iter().position(|&b| b == b'\n') {
             let line = self.buffer.drain(..=newline).collect::<Vec<u8>>();
@@ -41,8 +59,8 @@ impl SseFraming {
                     self.data_lines.push(s);
                 }
             }
-            // Other SSE fields (`event:`, `id:`, `retry:`) and comments are
-            // ignored for conversion purposes.
+            // Other SSE fields (`event:`, `id:`, `retry:`) are ignored for
+            // conversion purposes.
         }
         payloads
     }
@@ -106,6 +124,19 @@ mod tests {
         let mut f = SseFraming::new();
         assert!(f.push(b"data: {\"x\":1}\n").is_empty());
         assert_eq!(f.finish(), vec!["{\"x\":1}"]);
+        assert!(f.finish().is_empty());
+    }
+
+    #[test]
+    fn discards_oversized_unterminated_buffer() {
+        let mut f = SseFraming::new();
+        // Push more than the cap without a newline: must be discarded, and a
+        // following well-formed event must still parse.
+        let big = vec![b'x'; MAX_BUFFER_BYTES + 1];
+        assert!(f.push(&big).is_empty());
+        let payloads = f.push(b"\ndata: {\"ok\":true}\n\n");
+        assert_eq!(payloads, vec!["{\"ok\":true}"]);
+        // No leftover garbage from the discarded run.
         assert!(f.finish().is_empty());
     }
 }

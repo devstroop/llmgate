@@ -4,7 +4,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
 use axum::response::Response as AxumResponse;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 
 use super::error::AdapterError;
 use super::registry::{ProtocolAdapter, ProtocolRegistry};
@@ -24,7 +24,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config) -> Self {
-        let http = proxy::client(Duration::from_millis(config.upstream.timeout_ms));
+        let http = proxy::client();
         Self {
             resolver: ModelResolver::new(
                 config.models.default.clone(),
@@ -102,11 +102,24 @@ pub async fn handle_conversation(
     }
     headers.extend(upstream.request_headers());
 
-    let resp = match proxy::forward(&state.http, &url, &headers, &upstream_body).await {
-        Ok(r) => r,
-        Err(e) => {
-            let err = AdapterError::Internal(format!("upstream request failed: {e}"));
-            return error_json_response(client.serialize_error(&err));
+    let resp = if stream {
+        // Streaming: no total per-request timeout so long SSE streams are
+        // not cut off (lifetime bounded by the SSE protocol itself).
+        match proxy::forward_stream(&state.http, &url, &headers, &upstream_body).await {
+            Ok(r) => r,
+            Err(e) => {
+                let err = AdapterError::Internal(format!("upstream request failed: {e}"));
+                return error_json_response(client.serialize_error(&err));
+            }
+        }
+    } else {
+        let timeout = Duration::from_millis(state.config.upstream.timeout_ms);
+        match proxy::forward(&state.http, &url, &headers, &upstream_body, timeout).await {
+            Ok(r) => r,
+            Err(e) => {
+                let err = AdapterError::Internal(format!("upstream request failed: {e}"));
+                return error_json_response(client.serialize_error(&err));
+            }
         }
     };
 
@@ -206,7 +219,14 @@ pub async fn handle_models(state: Arc<AppState>, client_name: String) -> AxumRes
     }
     headers.extend(upstream.request_headers());
 
-    let resp = match proxy::forward_get(&state.http, &url, &headers).await {
+    let resp = match proxy::forward_get(
+        &state.http,
+        &url,
+        &headers,
+        Duration::from_millis(state.config.upstream.timeout_ms),
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
             let err = AdapterError::Internal(format!("upstream request failed: {e}"));
@@ -322,6 +342,30 @@ async fn handle_streaming_response(
         return error_json_response(client.serialize_error(&err));
     }
 
+    // If the upstream responded with plain JSON despite a streaming request
+    // (some OpenAI-compatible servers ignore `stream: true`), convert the
+    // body into a single-event stream rather than handing the client an empty
+    // stream.
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let looks_like_json = content_type
+        .as_deref()
+        .is_some_and(|ct| ct.starts_with("application/json"));
+
+    if looks_like_json {
+        let resp_text = match resp.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                let err = AdapterError::Internal(format!("failed to read upstream body: {e}"));
+                return error_json_response(client.serialize_error(&err));
+            }
+        };
+        return handle_json_as_stream(client, upstream, &resp_text).await;
+    }
+
     let upstream_stream = resp.bytes_stream();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(64);
 
@@ -382,9 +426,80 @@ async fn handle_streaming_response(
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
-        .body(Body::from_stream(
+        // Prevent intermediate proxies (e.g. nginx) from buffering the SSE
+        // stream, which would destroy event liveness.
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(keepalive_stream(
             tokio_stream::wrappers::ReceiverStream::new(rx),
-        ))
+            Duration::from_secs(15),
+        )))
+        .unwrap()
+}
+
+/// Wrap a stream of SSE bytes with periodic keep-alive comment lines sent
+/// during idle gaps, so long-lived streams (thinking, tool calls) survive
+/// proxies and clients that drop idle connections.
+fn keepalive_stream<S>(
+    inner: S,
+    interval: Duration,
+) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>>
+where
+    S: Stream<Item = Result<axum::body::Bytes, std::io::Error>> + 'static,
+{
+    let inner = Box::pin(inner);
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let keepalive = axum::body::Bytes::from(": keepalive\n\n");
+
+    // The pinned upstream, the interval, and the keep-alive byte string live
+    // in the *state* carried between unfold iterations (not captured by the
+    // FnMut), so the closure can be called many times.
+    futures_util::stream::unfold(
+        (inner, tick, keepalive),
+        move |(mut inner, mut tick, keepalive)| async move {
+            // Each iteration yields exactly one item (a real event or a
+            // keep-alive), never looping within a single poll.
+            tokio::select! {
+                next = inner.next() => {
+                                next.map(|item| (item, (inner, tick, keepalive)))
+                            },
+                _ = tick.tick() => Some((Ok(keepalive.clone()), (inner, tick, keepalive))),
+            }
+        },
+    )
+}
+
+/// The upstream replied with a plain JSON body despite a streaming request.
+/// Convert it into a single, already-complete stream for the client: decode
+/// the body through the upstream decoder, encode the neutral events with the
+/// client encoder, then send the terminal line. This avoids handing a client
+/// that requested streaming an empty stream.
+async fn handle_json_as_stream(
+    client: Arc<dyn ProtocolAdapter>,
+    upstream: Arc<dyn ProtocolAdapter>,
+    body: &str,
+) -> AxumResponse {
+    let mut decoder = upstream.stream_decoder();
+    let mut encoder = client.stream_encoder();
+    let mut lines: Vec<String> = Vec::new();
+
+    for event in decoder.feed(body) {
+        lines.extend(encoder.encode(event));
+    }
+    for event in decoder.finish() {
+        lines.extend(encoder.encode(event));
+    }
+    let done = encoder.done();
+    if !done.is_empty() {
+        lines.push(done);
+    }
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(Body::from(lines.join("")))
         .unwrap()
 }
 

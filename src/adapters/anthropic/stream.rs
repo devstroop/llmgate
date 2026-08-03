@@ -17,7 +17,6 @@ pub struct AnthropicStreamDecoder {
     message_id: String,
     model: String,
     input_tokens: u64,
-    current_tool_index: u32,
     stop_emitted: bool,
     pending_finish: Option<FinishReason>,
     pending_usage: Option<NeutralUsage>,
@@ -30,7 +29,6 @@ impl AnthropicStreamDecoder {
             message_id: String::new(),
             model: String::new(),
             input_tokens: 0,
-            current_tool_index: 0,
             stop_emitted: false,
             pending_finish: None,
             pending_usage: None,
@@ -88,7 +86,6 @@ impl StreamDecoder for AnthropicStreamDecoder {
                     .and_then(Value::as_str);
                 match btype {
                     Some("tool_use") => {
-                        self.current_tool_index = index;
                         let id = parsed
                             .get("content_block")
                             .and_then(|b| b.get("id"))
@@ -130,8 +127,10 @@ impl StreamDecoder for AnthropicStreamDecoder {
                         .and_then(|d| d.get("partial_json"))
                         .and_then(Value::as_str)
                         .map(|j| {
+                            // The delta's own index is authoritative: each
+                            // content_block_delta targets a specific block.
                             vec![NeutralStreamEvent::ToolCallDelta {
-                                index: self.current_tool_index.max(index),
+                                index,
                                 id: String::new(),
                                 name: String::new(),
                                 arguments: j.to_string(),
@@ -389,12 +388,18 @@ impl AnthropicStreamEncoder {
             BlockKind::Thinking => "thinking",
             BlockKind::ToolUse => "tool_use",
         };
+        // Thinking blocks carry a `thinking` field, not `text` (per the
+        // Anthropic streaming spec).
+        let content_block = match kind {
+            BlockKind::Thinking => json!({ "type": btype, "thinking": "" }),
+            _ => json!({ "type": btype, "text": "" }),
+        };
         lines.push(format!(
             "event: content_block_start\ndata: {}\n\n",
             json!({
                 "type": "content_block_start",
                 "index": self.block_index,
-                "content_block": { "type": btype, "text": "" },
+                "content_block": content_block,
             })
         ));
         self.current_block = Some(kind);
@@ -583,6 +588,20 @@ mod tests {
         let joined = all.join("");
         assert!(joined.contains("content_block_start"));
         assert!(joined.contains("\"type\":\"thinking\""));
+        // Thinking blocks must carry a `thinking` field (not `text`), per the
+        // Anthropic streaming spec. Keys are alphabetically sorted by serde.
+        let thinking_block_start = joined.find("content_block_start").unwrap();
+        let window = &joined[thinking_block_start..];
+        let window_end = window.find("signature_delta").unwrap_or(window.len());
+        let thinking_block = &joined[thinking_block_start..thinking_block_start + window_end];
+        assert!(
+            thinking_block.contains("\"thinking\""),
+            "thinking block should carry a thinking field, got: {thinking_block}"
+        );
+        assert!(
+            !thinking_block.contains("\"text\""),
+            "thinking block must NOT carry a text field, got: {thinking_block}"
+        );
         // Block switch: thinking -> text requires signature_delta + stop.
         assert!(joined.contains("signature_delta"));
         assert!(joined.contains("\"type\":\"text_delta\""));
