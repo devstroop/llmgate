@@ -1,27 +1,14 @@
 # model-adapter
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/devstroop/model-adapter/actions/workflows/ci.yml/badge.svg)](https://github.com/devstroop/model-adapter/actions/workflows/ci.yml)
+
 Protocol-agnostic LLM API adapter gateway in Rust.
 
 A reverse-proxy gateway that adapts between **LLM provider protocols** in both
 directions — OpenAI-compatible clients can talk to Anthropic-compatible
 upstreams and vice versa, with new protocols (Gemini, OpenAI Responses API,
 Ollama, Bedrock, ...) added as pluggable adapters without touching the core.
-
-## Status
-
-All planned milestones complete, including the M7 reliability-hardening pass.
-See [PLAN.md](PLAN.md) for the full plan and
-[the "adding a protocol" section](#adding-a-protocol) below for extending it.
-
-| Milestone | Scope | Status |
-|---|---|---|
-| M1 | Core framework: neutral model, adapter trait, registry, pipeline, config | done |
-| M2 | OpenAI adapter (non-stream) | done |
-| M3 | Anthropic adapter (non-stream) | done |
-| M4 | SSE streaming (both adapters) | done |
-| M5 | Auth, /v1/models, count_tokens | done |
-| M6 | Docs & hardening | done |
-| M7 | Reliability hardening (timeouts, keep-alive, request-ids, bounded buffering) | done |
 
 ## Design in one line
 
@@ -174,18 +161,19 @@ protocol-specific fragments (e.g. tool-call arguments) themselves.
 ## Verification
 
 ```bash
-cargo test        # 53 unit tests: converters, streams, sse, auth, config, resolver
+cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
 E2E smoke tests run manually against local mock upstreams (both directions,
-stream + non-stream, tools, auth, models — see commit messages for M3/M4 and
-the working-tree diff for M7).
+stream + non-stream, tools, auth, models).
 
-## Out of scope (for now)
+## Contributing
 
-- Embeddings / moderations / audio endpoints
-- Rate limiting, per-user budgets, cost tracking
-- Multi-upstream routing / load balancing / failover
-- Egress proxy pools
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the branch model, commit
+conventions, and review process.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
