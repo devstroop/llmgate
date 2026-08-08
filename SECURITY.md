@@ -6,7 +6,7 @@ Please do **not** open a public issue for security vulnerabilities. Report
 privately so the maintainers can fix and release before details are public.
 
 - **Email**: akash@devstroop.com
-- **Subject prefix**: `[model-adapter security]`
+- **Subject prefix**: `[llmgate security]`
 
 You can expect an acknowledgement within 48 hours and a status update within
 5 business days. Once a fix is available, a public advisory will describe the
