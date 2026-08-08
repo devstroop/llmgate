@@ -390,7 +390,7 @@ patterns = ['\bfoo@example\.com\b']
 
     #[test]
     fn explicit_config_path_missing_errors() {
-        let err = Config::load_path("/nonexistent/model-adapter-test.toml").unwrap_err();
+        let err = Config::load_path("/nonexistent/llmgate-test.toml").unwrap_err();
         assert!(err.to_string().contains("does not exist"));
     }
 

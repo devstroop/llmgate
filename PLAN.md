@@ -1,4 +1,4 @@
-# model-adapter — Development Plan
+# llmgate — Development Plan
 
 Protocol-agnostic LLM API adapter gateway written in Rust. Translates between
 provider protocols (OpenAI-compatible, Anthropic, and future ones) in both
@@ -7,7 +7,7 @@ directions, using a protocol-blind core and pluggable adapters.
 ## Vision
 
 Most gateways pick one canonical protocol (usually OpenAI) and hardcode
-conversion logic around it. `model-adapter` instead treats **every** protocol as
+conversion logic around it. `llmgate` instead treats **every** protocol as
 a plugin:
 
 ```
@@ -73,7 +73,7 @@ trait ProtocolAdapter: Send + Sync {
 ## Project layout
 
 ```
-model-adapter/
+llmgate/
 ├── Cargo.toml              # axum, tokio, reqwest, serde, serde_json, anyhow, thiserror, tracing, toml
 ├── config.example.toml
 ├── PLAN.md

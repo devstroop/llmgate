@@ -57,6 +57,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Project renamed `model-adapter` → `llmgate`** — package/binary name,
+  repository URL (`github.com/devstroop/llmgate`), and all docs
+  (README/CHANGELOG/CONTRIBUTING/SECURITY/PLAN/config.example) standardized
+  on the new name.
 - **Adapter trait** — new `stream_conversation_url()` default method lets
   protocols with distinct streaming endpoints (e.g. Gemini
   `:streamGenerateContent?alt=sse`) switch URLs per request; defaults to
@@ -273,4 +277,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Privacy Guard exhausts its token cap fail-closed (request rejected), never
   forwarding unredacted data.
 
-[Unreleased]: https://github.com/devstroop/model-adapter/compare/main...develop
+[Unreleased]: https://github.com/devstroop/llmgate/compare/main...develop
