@@ -1,10 +1,10 @@
 [package]
-name = "model-adapter"
+name = "llmgate"
 version = "0.1.0"
 edition = "2024"
 description = "Protocol-agnostic LLM API adapter gateway"
 license = "MIT"
-repository = "https://github.com/devstroop/model-adapter"
+repository = "https://github.com/devstroop/llmgate"
 readme = "README.md"
 keywords = ["llm", "gateway", "proxy", "openai", "anthropic", "adapter"]
 categories = ["network-programming", "web-programming"]

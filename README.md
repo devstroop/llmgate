@@ -1,7 +1,7 @@
 # llmgate
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![CI](https://github.com/devstroop/model-adapter/actions/workflows/ci.yml/badge.svg)](https://github.com/devstroop/model-adapter/actions/workflows/ci.yml)
+[![CI](https://github.com/devstroop/llmgate/actions/workflows/ci.yml/badge.svg)](https://github.com/devstroop/llmgate/actions/workflows/ci.yml)
 
 The zero-trust gateway for LLMs. It sits between your applications and cloud AI providers, translating across LLM protocols and inspecting every token in real time. Redact sensitive data, cache responses, and route requests across models and providers—all before your data reaches the cloud.
 
@@ -21,7 +21,7 @@ and error mapping.
 
 ```
 OpenAI client ──▶ /v1/chat/completions ──┐
-                                         ├─▶ model-adapter ──▶ upstream (any protocol, config-driven)
+                                         ├─▶ llmgate ──▶ upstream (any protocol, config-driven)
 Anthropic client ──▶ /v1/messages ───────┘                  ◀── responses converted back to client format
 ```
 
@@ -70,7 +70,7 @@ cargo build --release
 # create config (see config.example.toml)
 cp config.example.toml config.toml
 
-CONFIG_PATH=config.toml ./target/release/model-adapter
+CONFIG_PATH=config.toml ./target/release/llmgate
 ```
 
 Default upstream is `http://localhost:11434` (an OpenAI-compatible endpoint) —

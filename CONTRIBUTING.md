@@ -1,4 +1,4 @@
-# Contributing to model-adapter
+# Contributing to llmgate
 
 Thanks for your interest! This document covers the development workflow,
 conventions, and review process. It is the same workflow the maintainers use.
@@ -34,8 +34,8 @@ main ─────────────────────────
 Worktrees are the recommended way to work on multiple branches at once:
 
 ```bash
-git worktree add ../model-adapter-develop develop
-git worktree add ../model-adapter-gemini -b feat/adapter/gemini develop
+git worktree add ../llmgate-develop develop
+git worktree add ../llmgate-gemini -b feat/adapter/gemini develop
 ```
 
 ## Commit conventions

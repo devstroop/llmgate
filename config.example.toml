@@ -1,4 +1,4 @@
-# model-adapter example configuration.
+# llmgate example configuration.
 # Copy to config.toml and adjust. Every section is optional; defaults shown.
 
 [client]

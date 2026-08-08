@@ -9,10 +9,10 @@ use axum::routing::{get, post};
 use tokio::net::TcpListener;
 use tracing::Instrument;
 
-use model_adapter::auth::require_auth;
-use model_adapter::config::Config;
-use model_adapter::core::pipeline::{handle_conversation, handle_count_tokens, handle_models};
-use model_adapter::core::{AppState, EndpointKind};
+use llmgate::auth::require_auth;
+use llmgate::config::Config;
+use llmgate::core::pipeline::{handle_conversation, handle_count_tokens, handle_models};
+use llmgate::core::{AppState, EndpointKind};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,10 +26,10 @@ async fn main() -> anyhow::Result<()> {
     let mut state = AppState::new(config.clone())?;
 
     // Adapters are registered here as they land.
-    let mut registry = model_adapter::core::ProtocolRegistry::new();
-    registry.register(model_adapter::adapters::openai::adapter());
-    registry.register(model_adapter::adapters::anthropic::adapter());
-    registry.register(model_adapter::adapters::gemini::adapter());
+    let mut registry = llmgate::core::ProtocolRegistry::new();
+    registry.register(llmgate::adapters::openai::adapter());
+    registry.register(llmgate::adapters::anthropic::adapter());
+    registry.register(llmgate::adapters::gemini::adapter());
     state.registry = registry;
     let state = Arc::new(state);
 
@@ -164,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = (config.server.host.as_str(), config.server.port);
     let listener = TcpListener::bind(addr).await?;
-    tracing::info!("model-adapter listening on {}:{}", addr.0, addr.1);
+    tracing::info!("llmgate listening on {}:{}", addr.0, addr.1);
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
