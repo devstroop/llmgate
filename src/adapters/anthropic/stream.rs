@@ -14,6 +14,7 @@ use crate::core::registry::{StreamDecoder, StreamEncoder};
 /// Stateful Anthropic event → neutral events decoder.
 pub struct AnthropicStreamDecoder {
     started: bool,
+    failed: bool,
     message_id: String,
     model: String,
     input_tokens: u64,
@@ -26,6 +27,7 @@ impl AnthropicStreamDecoder {
     pub fn new() -> Self {
         Self {
             started: false,
+            failed: false,
             message_id: String::new(),
             model: String::new(),
             input_tokens: 0,
@@ -76,6 +78,12 @@ impl StreamDecoder for AnthropicStreamDecoder {
                 vec![NeutralStreamEvent::MessageStart {
                     id: self.message_id.clone(),
                     model: self.model.clone(),
+                    // input_tokens is known at stream start; carry it so
+                    // the encoder can report real accounting instead of 0.
+                    usage: Some(NeutralUsage {
+                        input_tokens: self.input_tokens,
+                        output_tokens: 0,
+                    }),
                 }]
             }
             "content_block_start" => {
@@ -137,7 +145,14 @@ impl StreamDecoder for AnthropicStreamDecoder {
                             }]
                         })
                         .unwrap_or_default(),
-                    // signature_delta carries no visible content.
+                    // The signature is opaque but REQUIRED when an
+                    // extended-thinking conversation continues: carry it
+                    // through so the encoder can echo it verbatim.
+                    Some("signature_delta") => delta
+                        .and_then(|d| d.get("signature"))
+                        .and_then(Value::as_str)
+                        .map(|s| vec![NeutralStreamEvent::ReasoningSignature(s.to_string())])
+                        .unwrap_or_default(),
                     _ => Vec::new(),
                 }
             }
@@ -174,6 +189,7 @@ impl StreamDecoder for AnthropicStreamDecoder {
             }
             "ping" => Vec::new(),
             "error" => {
+                self.failed = true;
                 let message = parsed
                     .get("error")
                     .and_then(|e| e.get("message"))
@@ -187,7 +203,9 @@ impl StreamDecoder for AnthropicStreamDecoder {
     }
 
     fn finish(&mut self) -> Vec<NeutralStreamEvent> {
-        if !self.started {
+        // After an error the stream must not synthesize a successful stop:
+        // the client needs to see the stream as failed.
+        if !self.started || self.failed {
             return Vec::new();
         }
         if !self.stop_emitted {
@@ -222,6 +240,17 @@ pub struct AnthropicStreamEncoder {
     block_index: u32,
     current_block: Option<BlockKind>,
     message_started: bool,
+    /// Opaque thinking signature received via `ReasoningSignature`; emitted
+    /// verbatim when the thinking block closes (Anthropic requires it to
+    /// continue an extended-thinking conversation).
+    pending_signature: Option<String>,
+    /// Neutral tool-call indices whose `content_block_start` was emitted,
+    /// so an id-less first fragment still opens the block (a later
+    /// `input_json_delta` must reference an opened block). Pruned when the
+    /// block closes, so a stream that reuses an index opens a fresh block.
+    tool_blocks_open: std::collections::HashSet<u32>,
+    /// Neutral index of the currently open tool-use block (for pruning).
+    open_tool_index: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,6 +266,9 @@ impl AnthropicStreamEncoder {
             block_index: 0,
             current_block: None,
             message_started: false,
+            pending_signature: None,
+            tool_blocks_open: std::collections::HashSet::new(),
+            open_tool_index: None,
         }
     }
 }
@@ -251,7 +283,7 @@ impl StreamEncoder for AnthropicStreamEncoder {
     fn encode(&mut self, event: NeutralStreamEvent) -> Vec<String> {
         let mut lines = Vec::new();
         match event {
-            NeutralStreamEvent::MessageStart { id, model } => {
+            NeutralStreamEvent::MessageStart { id, model, usage } => {
                 self.message_started = true;
                 lines.push(format!(
                     "event: message_start\ndata: {}\n\n",
@@ -265,7 +297,10 @@ impl StreamEncoder for AnthropicStreamEncoder {
                             "content": [],
                             "stop_reason": null,
                             "stop_sequence": null,
-                            "usage": { "input_tokens": 0, "output_tokens": 0 },
+                            "usage": {
+                                "input_tokens": usage.map(|u| u.input_tokens).unwrap_or(0),
+                                "output_tokens": 0,
+                            },
                         },
                     })
                 ));
@@ -292,15 +327,23 @@ impl StreamEncoder for AnthropicStreamEncoder {
                     })
                 ));
             }
+            NeutralStreamEvent::ReasoningSignature(signature) => {
+                // Stored until the thinking block closes; emitted verbatim
+                // in the closing signature_delta.
+                self.pending_signature = Some(signature);
+            }
             NeutralStreamEvent::ToolCallDelta {
                 index,
                 id,
                 name,
                 arguments,
             } => {
-                if !id.is_empty() {
+                if !self.tool_blocks_open.contains(&index) {
                     // New tool-use block: close any open block, start the
-                    // tool_use block at our own sequential index.
+                    // tool_use block at our own sequential index. The block
+                    // opens even when this fragment carries no id yet — a
+                    // later input_json_delta must never reference a block
+                    // that was never started.
                     self.close_block(&mut lines);
                     let block_index = self.block_index;
                     lines.push(format!(
@@ -317,6 +360,8 @@ impl StreamEncoder for AnthropicStreamEncoder {
                         })
                     ));
                     self.current_block = Some(BlockKind::ToolUse);
+                    self.tool_blocks_open.insert(index);
+                    self.open_tool_index = Some(index);
                 }
                 if !arguments.is_empty() {
                     lines.push(format!(
@@ -328,7 +373,6 @@ impl StreamEncoder for AnthropicStreamEncoder {
                         })
                     ));
                 }
-                let _ = index;
             }
             NeutralStreamEvent::MessageStop {
                 finish_reason,
@@ -408,14 +452,29 @@ impl AnthropicStreamEncoder {
     fn close_block(&mut self, lines: &mut Vec<String>) {
         if let Some(kind) = self.current_block.take() {
             if kind == BlockKind::Thinking {
-                lines.push(format!(
-                    "event: content_block_delta\ndata: {}\n\n",
-                    json!({
-                        "type": "content_block_delta",
-                        "index": self.block_index,
-                        "delta": { "type": "signature_delta", "signature": "" },
-                    })
-                ));
+                // The signature is only emitted when one was actually
+                // received: an EMPTY signature would be rejected by
+                // Anthropic if the client later continues an extended-
+                // thinking conversation, and thinking streamed from
+                // providers without signatures must not fabricate one.
+                if let Some(signature) = self.pending_signature.take() {
+                    lines.push(format!(
+                        "event: content_block_delta\ndata: {}\n\n",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": self.block_index,
+                            "delta": { "type": "signature_delta", "signature": signature },
+                        })
+                    ));
+                }
+            }
+            if kind == BlockKind::ToolUse {
+                // A closed tool block releases its neutral index: a stream
+                // that reuses an index must open a FRESH block, not stream
+                // deltas against the closed one.
+                if let Some(index) = self.open_tool_index.take() {
+                    self.tool_blocks_open.remove(&index);
+                }
             }
             lines.push(format!(
                 "event: content_block_stop\ndata: {}\n\n",
@@ -437,6 +496,140 @@ mod tests {
     }
 
     #[test]
+    fn error_chunk_suppresses_synthetic_stop() {
+        // An upstream error must not be followed by a synthesized
+        // successful stop (the client would see error + normal completion).
+        let mut d = AnthropicStreamDecoder::new();
+        d.feed(&event("message_start", json!({
+            "type": "message_start",
+            "message": { "id": "msg_1", "model": "claude", "usage": { "input_tokens": 5, "output_tokens": 0 } },
+        })));
+        let events = d.feed(&event(
+            "error",
+            json!({
+                "type": "error",
+                "error": { "type": "api_error", "message": "boom" },
+            }),
+        ));
+        assert!(
+            matches!(&events[0], NeutralStreamEvent::Error(e) if e.to_string().contains("boom"))
+        );
+        assert!(d.finish().is_empty(), "no stop after an error");
+    }
+
+    #[test]
+    fn message_start_carries_input_tokens() {
+        let mut d = AnthropicStreamDecoder::new();
+        let mut events = d.feed(&event("message_start", json!({
+            "type": "message_start",
+            "message": { "id": "msg_1", "model": "claude", "usage": { "input_tokens": 42, "output_tokens": 0 } },
+        })));
+        match &events[0] {
+            NeutralStreamEvent::MessageStart { usage, .. } => {
+                assert_eq!(usage.as_ref().map(|u| u.input_tokens), Some(42));
+            }
+            other => panic!("expected MessageStart, got {other:?}"),
+        }
+        // The encoder reports the real count instead of 0.
+        let mut e = AnthropicStreamEncoder::new();
+        let lines = e.encode(events.remove(0));
+        assert!(lines[0].contains("\"input_tokens\":42"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn signature_delta_round_trips_through_encoder() {
+        let mut d = AnthropicStreamDecoder::new();
+        let events = d.feed(&event(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": { "type": "signature_delta", "signature": "sig-abc-123" },
+            }),
+        ));
+        assert_eq!(
+            events,
+            vec![NeutralStreamEvent::ReasoningSignature("sig-abc-123".into())]
+        );
+        let mut e = AnthropicStreamEncoder::new();
+        e.encode(NeutralStreamEvent::MessageStart {
+            id: "m1".into(),
+            model: "claude".into(),
+            usage: None,
+        });
+        e.encode(NeutralStreamEvent::ReasoningDelta("hmm".into()));
+        e.encode(NeutralStreamEvent::ReasoningSignature("sig-abc-123".into()));
+        let lines = e.encode(NeutralStreamEvent::TextDelta("answer".into()));
+        let joined = lines.join("");
+        assert!(
+            joined.contains("\"signature\":\"sig-abc-123\""),
+            "signature must be echoed verbatim: {joined}"
+        );
+    }
+
+    #[test]
+    fn id_less_first_tool_fragment_still_opens_block() {
+        // A first ToolCallDelta without an id must still open the block, so
+        // the following input_json_delta references a started block.
+        let mut e = AnthropicStreamEncoder::new();
+        e.encode(NeutralStreamEvent::MessageStart {
+            id: "m1".into(),
+            model: "claude".into(),
+            usage: None,
+        });
+        let lines = e.encode(NeutralStreamEvent::ToolCallDelta {
+            index: 0,
+            id: String::new(), // id-less first fragment
+            name: String::new(),
+            arguments: "{\"city\": \"paris\"}".into(),
+        });
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("content_block_start"),
+            "block must open even without an id: {joined}"
+        );
+        assert!(
+            joined.contains("input_json_delta"),
+            "arguments must stream against the opened block: {joined}"
+        );
+    }
+
+    #[test]
+    fn reused_tool_index_reopens_a_fresh_block() {
+        // A stream that reuses a neutral tool index after its block closed
+        // must open a NEW content_block (the pruned register otherwise
+        // swallows the second call's content_block_start).
+        let mut e = AnthropicStreamEncoder::new();
+        e.encode(NeutralStreamEvent::MessageStart {
+            id: "m1".into(),
+            model: "claude".into(),
+            usage: None,
+        });
+        e.encode(NeutralStreamEvent::ToolCallDelta {
+            index: 0,
+            id: "call_1".into(),
+            name: "f".into(),
+            arguments: "{\"a\":1}".into(),
+        });
+        e.encode(NeutralStreamEvent::MessageStop {
+            finish_reason: FinishReason::ToolCalls,
+            usage: None,
+        });
+        let second = e.encode(NeutralStreamEvent::ToolCallDelta {
+            index: 0, // reused index
+            id: "call_2".into(),
+            name: "g".into(),
+            arguments: "{\"b\":2}".into(),
+        });
+        let joined = second.join("\n");
+        assert!(
+            joined.contains("content_block_start"),
+            "reused index must open a fresh block: {joined}"
+        );
+        assert!(joined.contains("\"id\":\"call_2\""), "{joined}");
+    }
+
+    #[test]
     fn decodes_anthropic_stream_sequence() {
         let mut d = AnthropicStreamDecoder::new();
         let events = d.feed(&event("message_start", json!({
@@ -446,7 +639,7 @@ mod tests {
                          "usage": {"input_tokens": 5, "output_tokens": 0}},
         })));
         assert!(
-            matches!(&events[0], NeutralStreamEvent::MessageStart { id, model } if id == "msg_1" && model == "claude")
+            matches!(&events[0], NeutralStreamEvent::MessageStart { id, model, .. } if id == "msg_1" && model == "claude")
         );
 
         assert!(
@@ -574,6 +767,7 @@ mod tests {
         all.extend(e.encode(NeutralStreamEvent::MessageStart {
             id: "msg_1".into(),
             model: "claude".into(),
+            usage: None,
         }));
         assert!(all[0].contains("event: message_start"));
 
@@ -592,7 +786,8 @@ mod tests {
         // Anthropic streaming spec. Keys are alphabetically sorted by serde.
         let thinking_block_start = joined.find("content_block_start").unwrap();
         let window = &joined[thinking_block_start..];
-        let window_end = window.find("signature_delta").unwrap_or(window.len());
+        // The thinking block's own section ends at its content_block_stop.
+        let window_end = window.find("content_block_stop").unwrap_or(window.len());
         let thinking_block = &joined[thinking_block_start..thinking_block_start + window_end];
         assert!(
             thinking_block.contains("\"thinking\""),
@@ -602,8 +797,11 @@ mod tests {
             !thinking_block.contains("\"text\""),
             "thinking block must NOT carry a text field, got: {thinking_block}"
         );
-        // Block switch: thinking -> text requires signature_delta + stop.
-        assert!(joined.contains("signature_delta"));
+        // Block switch: thinking -> text closes the thinking block. No
+        // signature_delta is emitted because no signature was received
+        // (fabricating an empty one would break extended-thinking
+        // continuations); the block still closes with content_block_stop.
+        assert!(!joined.contains("signature_delta"));
         assert!(joined.contains("\"type\":\"text_delta\""));
         assert!(joined.contains("message_delta"));
         assert!(joined.contains("\"stop_reason\":\"end_turn\""));
@@ -622,6 +820,7 @@ mod tests {
         all.extend(e.encode(NeutralStreamEvent::MessageStart {
             id: "m".into(),
             model: "c".into(),
+            usage: None,
         }));
         all.extend(e.encode(NeutralStreamEvent::ToolCallDelta {
             index: 0,

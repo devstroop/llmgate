@@ -35,6 +35,10 @@ version. There are no long-term-support branches at this time.
 
 - Inbound request bodies are capped at 16 MiB.
 - SSE framing buffers are capped at 64 MiB.
-- API-key comparison is constant-time.
+- API-key comparison is constant-time and bounded by the longest configured
+  key (a longer presented credential is rejected before comparison).
+- Empty or whitespace-only API keys are rejected at startup.
+- A `CONFIG_PATH` pointing at a missing file aborts startup — the gateway
+  never silently falls back to the default (unauthenticated) config.
 - Do not deploy with `[auth] api_keys = []` on an untrusted network — an empty
   key list disables authentication entirely.

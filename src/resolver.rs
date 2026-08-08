@@ -30,12 +30,18 @@ impl ModelResolver {
     }
 
     fn strip_prefix<'a>(&self, name: &'a str) -> &'a str {
+        // Longest-prefix match: `["vendor/", "vendor/gpt/"]` must strip
+        // `vendor/gpt/` from `vendor/gpt/4o` regardless of declaration
+        // order (a short prefix listed first would silently win).
+        let mut best: Option<(usize, &'a str)> = None;
         for prefix in &self.prefixes {
             if let Some(rest) = name.strip_prefix(prefix.as_str()) {
-                return rest;
+                if best.is_none_or(|(best_len, _)| prefix.len() > best_len) {
+                    best = Some((prefix.len(), rest));
+                }
             }
         }
-        name
+        best.map(|(_, rest)| rest).unwrap_or(name)
     }
 }
 
@@ -51,6 +57,19 @@ mod tests {
             map,
             vec!["vendor/".to_string(), "gateway/".to_string()],
         )
+    }
+
+    #[test]
+    fn longest_prefix_wins_regardless_of_order() {
+        // `vendor/gpt/4o` must strip `vendor/gpt/` -> `4o` (longest
+        // prefix), never the shorter `vendor/` -> `gpt/4o`.
+        for prefixes in [
+            vec!["vendor/".to_string(), "vendor/gpt/".to_string()],
+            vec!["vendor/gpt/".to_string(), "vendor/".to_string()],
+        ] {
+            let r = ModelResolver::new("default".into(), HashMap::new(), prefixes);
+            assert_eq!(r.resolve("vendor/gpt/4o"), "4o");
+        }
     }
 
     #[test]

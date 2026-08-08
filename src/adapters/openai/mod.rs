@@ -40,8 +40,11 @@ impl ProtocolAdapter for OpenAiAdapter {
         ]
     }
 
-    fn conversation_url(&self, base: &str, _model: &str) -> String {
-        format!("{}/v1/chat/completions", base.trim_end_matches('/'))
+    fn conversation_url(&self, base: &str, _model: &str) -> Result<String, AdapterError> {
+        Ok(format!(
+            "{}/v1/chat/completions",
+            base.trim_end_matches('/')
+        ))
     }
 
     fn models_path(&self) -> Option<&'static str> {

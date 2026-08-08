@@ -51,13 +51,14 @@ pub trait ProtocolAdapter: Send + Sync {
 
     /// Upstream conversation URL for this protocol, given the configured
     /// provider base URL. The `model` argument allows path-parameterized
-    /// protocols (e.g. Gemini `/{model}:generateContent`).
-    fn conversation_url(&self, base: &str, model: &str) -> String;
+    /// protocols (e.g. Gemini `/{model}:generateContent`). Fallible because
+    /// `model` is client-controlled and may be embedded in the URL path.
+    fn conversation_url(&self, base: &str, model: &str) -> Result<String, AdapterError>;
 
     /// Upstream conversation URL for a *streaming* request. Defaults to the
     /// non-streaming URL; protocols with a distinct streaming endpoint
     /// (e.g. Gemini `/{model}:streamGenerateContent?alt=sse`) override this.
-    fn stream_conversation_url(&self, base: &str, model: &str) -> String {
+    fn stream_conversation_url(&self, base: &str, model: &str) -> Result<String, AdapterError> {
         self.conversation_url(base, model)
     }
 
@@ -169,8 +170,8 @@ mod tests {
         fn endpoints(&self) -> Vec<(&'static str, EndpointKind)> {
             vec![("/v1/chat/completions", EndpointKind::Chat)]
         }
-        fn conversation_url(&self, base: &str, _model: &str) -> String {
-            format!("{}/chat/completions", base.trim_end_matches('/'))
+        fn conversation_url(&self, base: &str, _model: &str) -> Result<String, AdapterError> {
+            Ok(format!("{}/chat/completions", base.trim_end_matches('/')))
         }
         fn parse_request(&self, body: &str) -> Result<NeutralRequest, AdapterError> {
             let v: serde_json::Value = serde_json::from_str(body)

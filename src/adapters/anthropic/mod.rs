@@ -41,8 +41,8 @@ impl ProtocolAdapter for AnthropicAdapter {
         ]
     }
 
-    fn conversation_url(&self, base: &str, _model: &str) -> String {
-        format!("{}/v1/messages", base.trim_end_matches('/'))
+    fn conversation_url(&self, base: &str, _model: &str) -> Result<String, AdapterError> {
+        Ok(format!("{}/v1/messages", base.trim_end_matches('/')))
     }
 
     fn models_path(&self) -> Option<&'static str> {

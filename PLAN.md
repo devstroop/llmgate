@@ -41,13 +41,23 @@ Protocol-independent types in `src/core/neutral.rs`:
 trait ProtocolAdapter: Send + Sync {
     fn name(&self) -> &'static str;                          // "openai", "anthropic", ...
     fn endpoints(&self) -> Vec<(&'static str, EndpointKind)>; // inbound paths this protocol owns
-    fn parse_request(&self, body: &str) -> Result<NeutralRequest>;
-    fn serialize_request(&self, req: &NeutralRequest) -> Result<String>;
-    fn parse_response(&self, body: &str) -> Result<NeutralResponse>;
-    fn serialize_response(&self, resp: &NeutralResponse) -> Result<String>;
+    fn conversation_url(&self, base: &str, model: &str)
+        -> Result<String, AdapterError>;      // upstream chat URL (Result: reject path-injection)
+    fn stream_conversation_url(&self, base: &str, model: &str)
+        -> Result<String, AdapterError> {     // default = conversation_url(); override when the
+        self.conversation_url(base, model)    // streaming endpoint differs (e.g. Gemini ?alt=sse)
+    }
+    fn request_headers(&self) -> Vec<(String, String)>;
+    fn parse_request(&self, body: &str) -> Result<NeutralRequest, AdapterError>;
+    fn serialize_request(&self, req: &NeutralRequest) -> Result<String, AdapterError>;
+    fn parse_response(&self, body: &str) -> Result<NeutralResponse, AdapterError>;
+    fn serialize_response(&self, resp: &NeutralResponse) -> Result<String, AdapterError>;
     fn stream_decoder(&self) -> Box<dyn StreamDecoder>;       // upstream SSE -> NeutralStreamEvent
     fn stream_encoder(&self) -> Box<dyn StreamEncoder>;       // NeutralStreamEvent -> client SSE text
-    fn serialize_error(&self, err: &AdapterError) -> String;  // protocol-native error shape
+    fn serialize_error(&self, err: &AdapterError) -> (u16, String); // status + native error body
+    fn models_path(&self) -> Option<&'static str>;            // model listing path, if any
+    fn parse_models(&self, body: &str) -> Result<Vec<ModelInfo>, AdapterError>; // default: {"data":[...]}
+    fn serialize_models(&self, models: &[ModelInfo]) -> Result<String, AdapterError>;
 }
 ```
 
@@ -75,7 +85,8 @@ model-adapter/
     ├── resolver.rs         # model pipeline (agnostic)
     ├── proxy.rs            # reqwest forwarding (streaming + non-streaming, timeout split)
     ├── core/               # protocol-agnostic core
-    │   ├── mod.rs          # trait definitions, registry, pipeline orchestration
+    │   ├── mod.rs          # module wiring
+    │   ├── registry.rs     # ProtocolAdapter trait, StreamDecoder/Encoder, registry
     │   ├── neutral.rs      # NeutralRequest / NeutralResponse / NeutralStreamEvent
     │   ├── pipeline.rs     # generic handler: parse -> resolve -> forward -> convert back
     │   ├── error.rs        # AdapterError (rate_limit, auth, overloaded, quota, api, ...)
@@ -120,6 +131,7 @@ Work in `src/adapters/*/` — the tables below live inside each adapter, not the
 | M6 | Docs & hardening | Done. README + "adding a protocol" guide, config.example.toml, curl examples, clippy clean. |
 | M7 | Reliability hardening | Done. Spec-faithful thinking blocks, timeout split, SSE keep-alive + proxy headers, bounded SSE buffering, constant-time auth, request-id tracing, JSON-as-stream fallback. |
 | M8 | gemini adapter | Done. Upstream-side `generateContent` adapter: request/response conversion (tools, thinking, images), SSE stream decoder/encoder, error mapping, model listing, `streamGenerateContent` URL switching. |
+| M9 | Privacy Guard | Done. Reversible redaction (`[privacy_guard]`): regex rules + allow-list, session-scoped token vault, streaming restore across fragmented SSE chunks (buffered Aho-Corasick, per channel), fail-closed config validation. |
 
 ### M1 details
 
@@ -186,11 +198,38 @@ now be routed to a Gemini provider:
   path-parameterized routing) is a follow-up milestone; this adapter serves as
   an upstream only for now.
 
+### M9 details (privacy guard)
+
+- **Config** — `[privacy_guard]` (enabled, vault, rules, allow_list);
+  disabled by default. With `enabled = true` and no rules, a built-in
+  conservative set runs (email, IPv4, US phone, API keys). Fail closed:
+  invalid patterns, templates without `{n}`, or a non-`"memory"` vault
+  abort startup.
+- **Redaction** — `RedactionEngine` (compiled rules + allow-list) shared
+  per process; `RedactionSession` per request, applied to every
+  text-bearing content block (text, thinking, tool results, tool-call
+  input JSON). Repeated values reuse one token per rule; 4096-token
+  session cap.
+- **Vault** — session-scoped in-memory token ↔ original map, dropped with
+  the request; automaton cache rebuilt on new tokens.
+- **Streaming restore** — `RestoreStream` buffers fragments and matches
+  tokens with Aho-Corasick across SSE chunk boundaries; per-channel
+  isolation (text / reasoning / tool arguments) via `StreamRestorer`;
+  bounded hold-back so plain text never lags more than one token length.
+  Token grammar (`<NAME_n>` with `>` terminator) guarantees no prefix
+  collisions (`<IP_1>` never matches inside `<IP_10>`).
+- **E2E verified** — mock upstream + curl: redacted upstream bodies,
+  restored client responses for non-streaming, streaming (fragmented
+  chunks), and the JSON-as-stream fallback; disabled mode is byte-for-byte
+  passthrough.
+
 ## Verification
 
-- `cargo test` — 68 unit tests: per-adapter conversion/stream tests (openai,
+- `cargo test` — 95 unit tests: per-adapter conversion/stream tests (openai,
   anthropic, gemini) + core (sse framing incl. buffer cap, auth incl.
-  constant-time, config, resolver).
+  constant-time, config, resolver) + privacy guard (redaction, allow-list,
+  round-trips, fragmented stream restore, prefix-collision safety, token
+  cap, fail-closed validation).
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo fmt --check`
 - Manual curl smoke tests for both protocols (stream + non-stream, tools,
@@ -199,6 +238,6 @@ now be routed to a Gemini provider:
 ## Out of scope (for now)
 
 - Embeddings / moderations / audio endpoints (sidecars etc.)
-- Token-count heuristics, rate limiting, per-user budgets
+- Exact (non-heuristic) token counting, rate limiting, per-user budgets
 - Multi-upstream routing / load balancing / failover
 - Warpgate-style egress proxy pools

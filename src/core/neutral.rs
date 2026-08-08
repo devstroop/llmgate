@@ -46,6 +46,12 @@ pub enum ContentBlock {
         content: String,
         is_error: bool,
     },
+    /// Anthropic `redacted_thinking` block (extended thinking redaction):
+    /// the opaque payload must be echoed back verbatim when a conversation
+    /// with extended thinking is continued, so it is carried as-is.
+    RedactedThinking {
+        data: String,
+    },
 }
 
 impl ContentBlock {
@@ -73,6 +79,10 @@ pub struct NeutralRequest {
     pub messages: Vec<NeutralMessage>,
     pub tools: Vec<NeutralTool>,
     pub max_tokens: Option<u32>,
+    /// OpenAI `max_completion_tokens` (the field several reasoning models
+    /// accept instead of `max_tokens`). Serializers re-emit whichever
+    /// field the client used.
+    pub max_completion_tokens: Option<u32>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub top_k: Option<u32>,
@@ -87,6 +97,7 @@ impl NeutralRequest {
             messages,
             tools: Vec::new(),
             max_tokens: None,
+            max_completion_tokens: None,
             temperature: None,
             top_p: None,
             top_k: None,
@@ -149,9 +160,16 @@ pub enum NeutralStreamEvent {
     MessageStart {
         id: String,
         model: String,
+        /// Initial usage if the upstream reported it at stream start
+        /// (e.g. Anthropic `message_start` carries input_tokens).
+        usage: Option<NeutralUsage>,
     },
     TextDelta(String),
     ReasoningDelta(String),
+    /// Opaque reasoning signature (Anthropic `signature_delta`): must be
+    /// echoed back verbatim when a thinking block closes so extended
+    /// thinking conversations can continue.
+    ReasoningSignature(String),
     /// Tool-call arguments arrive incrementally; adapters accumulate them and
     /// emit the completed call on stream end (or a zero-length delta).
     ToolCallDelta {

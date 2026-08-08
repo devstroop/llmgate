@@ -90,8 +90,8 @@ The core is protocol-blind; adding a protocol is additive. See
 - `README.md` describes what the project does and how to use it. It is
   user-facing and must not contain project-status/milestone tracking — that
   lives in `CHANGELOG.md` and `PLAN.md`.
-- `CHANGELOG.md` records user-visible changes, [Keep a Changelog]
-  (https://keepachangelog.com/) style.
+- `CHANGELOG.md` records user-visible changes,
+  [Keep a Changelog](https://keepachangelog.com/) style.
 - `PLAN.md` is the maintainers' roadmap/milestone tracker.
 - `config.example.toml` documents the configuration surface; keep it in sync
   with `src/config.rs`.

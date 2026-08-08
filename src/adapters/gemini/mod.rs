@@ -43,20 +43,22 @@ impl ProtocolAdapter for GeminiAdapter {
         Vec::new()
     }
 
-    fn conversation_url(&self, base: &str, model: &str) -> String {
-        format!(
-            "{}/v1beta/models/{}:generateContent",
+    fn conversation_url(&self, base: &str, model: &str) -> Result<String, AdapterError> {
+        validate_model_segment(model)?;
+        Ok(format!(
+            "{}/v1beta/{}:generateContent",
             base.trim_end_matches('/'),
-            model
-        )
+            resource_path(model)
+        ))
     }
 
-    fn stream_conversation_url(&self, base: &str, model: &str) -> String {
-        format!(
-            "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+    fn stream_conversation_url(&self, base: &str, model: &str) -> Result<String, AdapterError> {
+        validate_model_segment(model)?;
+        Ok(format!(
+            "{}/v1beta/{}:streamGenerateContent?alt=sse",
             base.trim_end_matches('/'),
-            model
-        )
+            resource_path(model)
+        ))
     }
 
     fn models_path(&self) -> Option<&'static str> {
@@ -154,7 +156,172 @@ impl ProtocolAdapter for GeminiAdapter {
     }
 }
 
+/// Map a model name to the Gemini resource path. Bare ids (e.g.
+/// `gemini-2.5-flash`) live under `models/`; already-prefixed names
+/// (`models/x`, `tunedModels/y`) are resource paths in their own right and
+/// must not be double-prefixed.
+fn resource_path(model: &str) -> String {
+    if model.starts_with("models/") || model.starts_with("tunedModels/") {
+        model.to_string()
+    } else {
+        format!("models/{model}")
+    }
+}
+
+/// Validate that a client-supplied model name is safe to embed in the
+/// upstream URL path. The model segment is client-controlled, so anything
+/// beyond unreserved path characters (plus `/` for the `models/` and
+/// `tunedModels/` prefixes) is rejected, as are `.`/`..` segments — a
+/// crafted name must not be able to inject query params, fragments, or
+/// path traversal into the upstream request.
+fn validate_model_segment(model: &str) -> Result<(), AdapterError> {
+    if model.is_empty() {
+        return Err(AdapterError::InvalidRequest(
+            "model name must not be empty".to_string(),
+        ));
+    }
+    if !model
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/'))
+    {
+        return Err(AdapterError::InvalidRequest(format!(
+            "model name contains characters not allowed in a URL path segment: {model:?}"
+        )));
+    }
+    for segment in model.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(AdapterError::InvalidRequest(format!(
+                "model name must not contain empty or '.'/'..' path segments: {model:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Convenience for registering with the registry.
 pub fn adapter() -> Arc<GeminiAdapter> {
     Arc::new(GeminiAdapter)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn adapter() -> GeminiAdapter {
+        GeminiAdapter
+    }
+
+    #[test]
+    fn rejects_query_injection_in_model() {
+        // A crafted model name must never inject query params into the
+        // upstream URL.
+        assert!(
+            adapter()
+                .conversation_url("https://api.example.com", "gpt-4?x=1")
+                .is_err()
+        );
+        assert!(
+            adapter()
+                .conversation_url("https://api.example.com", "gpt-4#frag")
+                .is_err()
+        );
+        assert!(
+            adapter()
+                .conversation_url("https://api.example.com", "a&b=1")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_path_traversal_in_model() {
+        assert!(
+            adapter()
+                .conversation_url("https://api.example.com", "../v1beta")
+                .is_err()
+        );
+        assert!(
+            adapter()
+                .conversation_url("https://api.example.com", "a/../b")
+                .is_err()
+        );
+        assert!(
+            adapter()
+                .conversation_url("https://api.example.com", "..")
+                .is_err()
+        );
+        assert!(
+            adapter()
+                .conversation_url("https://api.example.com", ".")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_empty_and_whitespace_models() {
+        assert!(
+            adapter()
+                .conversation_url("https://api.example.com", "")
+                .is_err()
+        );
+        assert!(
+            adapter()
+                .conversation_url("https://api.example.com", "gemini 2.5")
+                .is_err()
+        );
+        assert!(
+            adapter()
+                .conversation_url("https://api.example.com", "gemini%2Dflash")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn accepts_normal_model_ids() {
+        let url = adapter()
+            .conversation_url(
+                "https://generativelanguage.googleapis.com",
+                "gemini-2.5-flash",
+            )
+            .unwrap();
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+        );
+    }
+
+    #[test]
+    fn accepts_prefixed_model_ids() {
+        // Prefixed ids are full resource paths: they must not be
+        // double-prefixed with `models/`.
+        let url = adapter()
+            .conversation_url("https://api.example.com", "models/gemini-2.5-flash")
+            .unwrap();
+        assert_eq!(
+            url,
+            "https://api.example.com/v1beta/models/gemini-2.5-flash:generateContent"
+        );
+        let url = adapter()
+            .conversation_url("https://api.example.com", "tunedModels/my-tuned")
+            .unwrap();
+        assert_eq!(
+            url,
+            "https://api.example.com/v1beta/tunedModels/my-tuned:generateContent"
+        );
+    }
+
+    #[test]
+    fn stream_url_switches_endpoint_and_keeps_validation() {
+        let url = adapter()
+            .stream_conversation_url("https://api.example.com/", "gemini-2.5-pro")
+            .unwrap();
+        assert_eq!(
+            url,
+            "https://api.example.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+        );
+        assert!(
+            adapter()
+                .stream_conversation_url("https://api.example.com", "gemini?alt=x")
+                .is_err()
+        );
+    }
 }

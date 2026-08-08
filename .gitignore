@@ -1,1 +1,5 @@
 /target
+# Local configuration carries upstream credentials and client API keys;
+# never commit it.
+/config.toml
+/config.local.toml
