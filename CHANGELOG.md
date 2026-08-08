@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Community-standard docs** — `CODE_OF_CONDUCT.md` (Contributor Covenant
+  2.1), GitHub issue templates (bug report, feature request), and a pull
+  request template; README now links the security policy and code of conduct.
 - **Gemini adapter (upstream)** — `generateContent` request/response conversion
   (`systemInstruction`, `contents`/`parts`, `generationConfig`), including
   `inlineData` images, `thought` thinking parts, and

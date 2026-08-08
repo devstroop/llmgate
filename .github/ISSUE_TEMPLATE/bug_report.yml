@@ -1,0 +1,70 @@
+name: Bug report
+description: Report a bug in llmgate
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report. Please
+        [search existing issues](https://github.com/devstroop/llmgate/issues?q=is%3Aissue)
+        first, and redact any secrets (API keys, credentials) before pasting
+        configuration or logs.
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Version from Cargo.toml, or the git commit you are running
+      placeholder: e.g. 0.1.0 or 9102cc6
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration (secrets removed)
+      description: Relevant parts of your config.toml — protocols, upstream, auth, privacy_guard
+      render: toml
+  - type: dropdown
+    id: protocol
+    attributes:
+      label: Protocols involved
+      description: Which client/upstream protocol combination triggers the bug?
+      multiple: true
+      options:
+        - OpenAI client
+        - Anthropic client
+        - Gemini upstream
+        - OpenAI upstream
+        - Anthropic upstream
+        - Other
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Request mode
+      options:
+        - Non-streaming
+        - Streaming (SSE)
+        - Tool calling
+        - Model listing
+        - Privacy Guard redaction/restore
+        - Auth / headers
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened, and what you expected instead
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start the gateway with ...
+        2. Send ...
+        3. Observe ...
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / upstream response
+      description: Gateway logs (RUST_LOG=...), request/response bodies — secrets removed
+      render: shell

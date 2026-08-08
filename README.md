@@ -264,7 +264,19 @@ stream + non-stream, tools, auth, models).
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the branch model, commit
-conventions, and review process.
+conventions, and review process. Changes are tracked in
+[CHANGELOG.md](CHANGELOG.md).
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for the vulnerability reporting policy and
+supported-version scope. **Do not open public issues for security
+vulnerabilities** — report them privately.
+
+## Code of conduct
+
+All contributors are expected to follow the
+[Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## License
 

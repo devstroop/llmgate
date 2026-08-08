@@ -98,5 +98,7 @@ The core is protocol-blind; adding a protocol is additive. See
 
 ## Code of conduct
 
-Be respectful and constructive. Disagreement is fine; personal attacks are
-not. Report unacceptable behavior to the maintainers.
+All contributors are expected to follow the
+[Code of Conduct](CODE_OF_CONDUCT.md). Be respectful and constructive;
+disagreement is fine, personal attacks are not. Report unacceptable behavior
+to the maintainers (akash@devstroop.com).
