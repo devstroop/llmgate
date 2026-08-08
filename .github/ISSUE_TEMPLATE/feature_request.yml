@@ -1,0 +1,32 @@
+name: Feature request
+description: Propose a feature for llmgate
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for proposing a feature. Please [search existing
+        issues](https://github.com/devstroop/llmgate/issues?q=is%3Aissue)
+        first so related ideas stay in one thread.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What problem does this solve, and who hits it? Avoid prescribing a solution here.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How should it behave? Protocol/config surface if applicable
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you evaluated and why they fall short
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: Affected protocols (OpenAI/Anthropic/Gemini), config surface, streaming path, performance, or security considerations
