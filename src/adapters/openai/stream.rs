@@ -8,12 +8,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
+use crate::core::error::AdapterError;
 use crate::core::neutral::{FinishReason, NeutralStreamEvent, NeutralUsage};
 use crate::core::registry::{StreamDecoder, StreamEncoder};
 
 /// Stateful OpenAI chunk → neutral events decoder.
 pub struct OpenAiStreamDecoder {
     started: bool,
+    failed: bool,
+    stop_emitted: bool,
     seen_tool_indices: HashSet<u32>,
     pending_finish: Option<FinishReason>,
     pending_usage: Option<NeutralUsage>,
@@ -23,6 +26,8 @@ impl OpenAiStreamDecoder {
     pub fn new() -> Self {
         Self {
             started: false,
+            failed: false,
+            stop_emitted: false,
             seen_tool_indices: HashSet::new(),
             pending_finish: None,
             pending_usage: None,
@@ -43,6 +48,18 @@ impl StreamDecoder for OpenAiStreamDecoder {
             Err(_) => return Vec::new(),
         };
 
+        // Upstream error payloads must surface as an Error event, not be
+        // swallowed into a spurious MessageStart + synthetic stop.
+        if let Some(error) = parsed.get("error") {
+            self.failed = true;
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("upstream stream error")
+                .to_string();
+            return vec![NeutralStreamEvent::Error(AdapterError::Api(message))];
+        }
+
         let mut events = Vec::new();
 
         if !self.started {
@@ -58,6 +75,7 @@ impl StreamDecoder for OpenAiStreamDecoder {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
+                usage: None,
             });
         }
 
@@ -110,9 +128,12 @@ impl StreamDecoder for OpenAiStreamDecoder {
     }
 
     fn finish(&mut self) -> Vec<NeutralStreamEvent> {
-        if !self.started {
+        if !self.started || self.failed || self.stop_emitted {
             return Vec::new();
         }
+        // Emit the terminal event exactly once (idempotent for repeated
+        // finish calls, e.g. the pipeline's post-loop flush).
+        self.stop_emitted = true;
         vec![NeutralStreamEvent::MessageStop {
             finish_reason: self.pending_finish.clone().unwrap_or(FinishReason::Stop),
             usage: self.pending_usage,
@@ -205,7 +226,7 @@ impl Default for OpenAiStreamEncoder {
 impl StreamEncoder for OpenAiStreamEncoder {
     fn encode(&mut self, event: NeutralStreamEvent) -> Vec<String> {
         match event {
-            NeutralStreamEvent::MessageStart { id, model } => {
+            NeutralStreamEvent::MessageStart { id, model, .. } => {
                 self.id = id;
                 self.model = model;
                 vec![self.chunk(json!({
@@ -256,6 +277,10 @@ impl StreamEncoder for OpenAiStreamEncoder {
                         "finish_reason": null,
                     }],
                 }))]
+            }
+            NeutralStreamEvent::ReasoningSignature(_) => {
+                // No OpenAI equivalent; signatures are Anthropic-specific.
+                Vec::new()
             }
             NeutralStreamEvent::MessageStop {
                 finish_reason,
@@ -409,11 +434,42 @@ mod tests {
     }
 
     #[test]
+    fn error_chunk_produces_error_event_and_no_synthetic_stop() {
+        let mut d = OpenAiStreamDecoder::new();
+        let events =
+            d.feed(&json!({"error": {"message": "boom", "type": "server_error"}}).to_string());
+        assert!(matches!(
+            &events[0],
+            NeutralStreamEvent::Error(e) if e.to_string().contains("boom")
+        ));
+        assert!(
+            !matches!(&events[0], NeutralStreamEvent::MessageStart { .. }),
+            "an error payload must not be treated as a message start"
+        );
+        assert!(
+            d.finish().is_empty(),
+            "finish() must not report a successful stop after an error"
+        );
+    }
+
+    #[test]
+    fn finish_is_idempotent() {
+        let mut d = OpenAiStreamDecoder::new();
+        d.feed(&chunk("c1", json!({"role": "assistant"}), None));
+        assert!(matches!(
+            &d.finish()[0],
+            NeutralStreamEvent::MessageStop { .. }
+        ));
+        assert!(d.finish().is_empty(), "second finish() must not re-emit");
+    }
+
+    #[test]
     fn encodes_neutral_events_to_chunks() {
         let mut e = OpenAiStreamEncoder::new();
         let lines = e.encode(NeutralStreamEvent::MessageStart {
             id: "c1".into(),
             model: "m".into(),
+            usage: None,
         });
         assert!(lines[0].starts_with("data: "));
         let v: Value = serde_json::from_str(&lines[0][6..]).unwrap();

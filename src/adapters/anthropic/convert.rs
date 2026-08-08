@@ -50,9 +50,7 @@ pub fn parse_request(body: &str) -> Result<NeutralRequest, AdapterError> {
 
     if let Some(msgs) = root.get("messages").and_then(Value::as_array) {
         for msg in msgs {
-            if let Some(m) = parse_message(msg) {
-                messages.push(m);
-            }
+            messages.extend(parse_messages(msg));
         }
     }
 
@@ -73,6 +71,7 @@ pub fn parse_request(body: &str) -> Result<NeutralRequest, AdapterError> {
             .get("max_tokens")
             .and_then(Value::as_u64)
             .map(|v| v as u32),
+        max_completion_tokens: None,
         temperature: root.get("temperature").and_then(Value::as_f64),
         top_p: root.get("top_p").and_then(Value::as_f64),
         top_k: root.get("top_k").and_then(Value::as_u64).map(|v| v as u32),
@@ -90,18 +89,58 @@ pub fn parse_request(body: &str) -> Result<NeutralRequest, AdapterError> {
     })
 }
 
-fn parse_message(msg: &Value) -> Option<NeutralMessage> {
-    let role = msg.get("role")?.as_str()?;
+/// Parse one Anthropic message into neutral messages.
+///
+/// Anthropic sends tool results as `role: "user"` messages containing
+/// tool_result blocks; those normalize to the Tool role so every serializer
+/// emits them as tool results (OpenAI/Gemini key off the Tool role, and
+/// dropping them would break the tool loop). A user message mixing TEXT with
+/// tool_result blocks (which Anthropic permits) is split: the results become
+/// a Tool message, the remaining blocks a User message — no content is lost.
+fn parse_messages(msg: &Value) -> Vec<NeutralMessage> {
+    let Some(role) = msg.get("role").and_then(Value::as_str) else {
+        return Vec::new();
+    };
     let neutral_role = match role {
         "user" => NeutralRole::User,
         "assistant" => NeutralRole::Assistant,
-        _ => return None,
+        _ => return Vec::new(),
     };
     let blocks = parse_content_blocks(msg.get("content"));
-    Some(NeutralMessage {
+    if neutral_role == NeutralRole::User {
+        let has_results = blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+        if has_results {
+            let results: Vec<ContentBlock> = blocks
+                .iter()
+                .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                .cloned()
+                .collect();
+            let rest: Vec<ContentBlock> = blocks
+                .into_iter()
+                .filter(|b| !matches!(b, ContentBlock::ToolResult { .. }))
+                .collect();
+            let mut out = Vec::new();
+            if !results.is_empty() {
+                out.push(NeutralMessage {
+                    role: NeutralRole::Tool,
+                    content: results,
+                });
+            }
+            if !rest.is_empty() {
+                out.push(NeutralMessage {
+                    role: NeutralRole::User,
+                    content: rest,
+                });
+            }
+            return out;
+        }
+    }
+    vec![NeutralMessage {
         role: neutral_role,
         content: blocks,
-    })
+    }]
 }
 
 /// Anthropic content: a string, or an array of typed blocks.
@@ -139,11 +178,11 @@ fn parse_block(block: &Value) -> Option<ContentBlock> {
                 .and_then(Value::as_str)
                 .map(String::from),
         }),
-        // Redacted thinking carries no visible content; preserved as an empty
-        // thinking block so the stream position is not lost.
-        "redacted_thinking" => Some(ContentBlock::Thinking {
-            thinking: String::new(),
-            signature: None,
+        // Redacted thinking carries an opaque payload that Anthropic
+        // requires echoing back verbatim in continued conversations;
+        // preserve it as-is.
+        "redacted_thinking" => Some(ContentBlock::RedactedThinking {
+            data: block.get("data")?.as_str()?.to_string(),
         }),
         "tool_use" => Some(ContentBlock::ToolUse {
             id: block.get("id")?.as_str()?.to_string(),
@@ -275,7 +314,11 @@ pub fn serialize_request(req: &NeutralRequest) -> Result<String, AdapterError> {
 
     root.insert(
         "max_tokens".to_string(),
-        json!(req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
+        json!(
+            req.max_tokens
+                .or(req.max_completion_tokens)
+                .unwrap_or(DEFAULT_MAX_TOKENS)
+        ),
     );
     if let Some(t) = req.temperature {
         root.insert("temperature".to_string(), json!(t));
@@ -345,6 +388,21 @@ fn serialize_assistant_blocks(content: &[ContentBlock]) -> Value {
 fn serialize_assistant_block(block: &ContentBlock) -> Option<Value> {
     match block {
         ContentBlock::Text(t) => Some(json!({ "type": "text", "text": t })),
+        ContentBlock::Image { media_type, base64 } => {
+            // Model-generated images (e.g. Gemini inlineData routed to an
+            // Anthropic client) must not vanish silently.
+            if media_type == "url" {
+                Some(json!({
+                    "type": "image",
+                    "source": { "type": "url", "url": base64 },
+                }))
+            } else {
+                Some(json!({
+                    "type": "image",
+                    "source": { "type": "base64", "media_type": media_type, "data": base64 },
+                }))
+            }
+        }
         ContentBlock::Thinking {
             thinking,
             signature,
@@ -362,6 +420,12 @@ fn serialize_assistant_block(block: &ContentBlock) -> Option<Value> {
             "id": id,
             "name": name,
             "input": input,
+        })),
+        // Redacted thinking must be echoed back verbatim (Anthropic
+        // requirement for continued extended-thinking conversations).
+        ContentBlock::RedactedThinking { data } => Some(json!({
+            "type": "redacted_thinking",
+            "data": data,
         })),
         _ => None,
     }
@@ -454,9 +518,16 @@ pub fn serialize_response(resp: &NeutralResponse) -> Result<String, AdapterError
     root.insert("type".to_string(), Value::String("message".to_string()));
     root.insert("role".to_string(), Value::String("assistant".to_string()));
     root.insert("model".to_string(), Value::String(resp.model.clone()));
+    // Anthropic response `content` must be an array of blocks (never a
+    // bare string), even when empty.
     root.insert(
         "content".to_string(),
-        serialize_assistant_blocks(&resp.content),
+        Value::Array(
+            resp.content
+                .iter()
+                .filter_map(serialize_assistant_block)
+                .collect(),
+        ),
     );
     root.insert(
         "stop_reason".to_string(),
@@ -513,6 +584,107 @@ pub fn serialize_error(err: &AdapterError) -> (u16, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_response_serializes_content_as_array() {
+        // Anthropic `/v1/messages` responses require `content` to be an
+        // array; a string would be rejected by compliant clients.
+        let resp = NeutralResponse {
+            id: "r1".into(),
+            model: "m".into(),
+            content: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: None,
+        };
+        let out = serialize_response(&resp).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["content"], Value::Array(vec![]));
+    }
+
+    #[test]
+    fn redacted_thinking_round_trips_verbatim() {
+        // Anthropic requires redacted_thinking blocks to be echoed back
+        // verbatim (opaque `data` payload) in continued conversations.
+        let body = r#"{
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "claude",
+            "content": [{"type": "redacted_thinking", "data": "Zm9vYmFy"}],
+            "stop_reason": "end_turn", "stop_sequence": null,
+            "usage": {"input_tokens": 5, "output_tokens": 3}
+        }"#;
+        let resp = parse_response(body).unwrap();
+        match &resp.content[0] {
+            ContentBlock::RedactedThinking { data } => assert_eq!(data, "Zm9vYmFy"),
+            other => panic!("expected redacted thinking, got {other:?}"),
+        }
+        let out = serialize_response(&resp).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["content"][0]["type"], "redacted_thinking");
+        assert_eq!(v["content"][0]["data"], "Zm9vYmFy");
+    }
+
+    #[test]
+    fn mixed_user_message_with_tool_result_splits() {
+        // Anthropic permits text + tool_result in one user message; the
+        // split must keep BOTH (results as Tool, text as User).
+        let body = r#"{
+            "model": "claude",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_1", "name": "get_weather", "input": {"city": "paris"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "thanks!"},
+                    {"type": "tool_result", "tool_use_id": "tu_1", "content": "22c"}
+                ]}
+            ]
+        }"#;
+        let req = parse_request(body).unwrap();
+        assert_eq!(req.messages.len(), 3, "mixed message splits into two");
+        assert_eq!(req.messages[1].role, NeutralRole::Tool);
+        assert!(matches!(
+            &req.messages[1].content[0],
+            ContentBlock::ToolResult { .. }
+        ));
+        assert_eq!(req.messages[2].role, NeutralRole::User);
+        assert!(matches!(&req.messages[2].content[0], ContentBlock::Text(t) if t == "thanks!"));
+        // Anthropic round trip: Tool messages serialize as user messages
+        // with tool_result blocks (spec shape); the text stays a user
+        // message.
+        let out = serialize_request(&req).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"][0]["type"], "tool_result");
+        assert_eq!(msgs[1]["content"][0]["content"], "22c");
+        assert_eq!(msgs[2]["role"], "user");
+        // Single-text messages collapse to a bare string (spec shape).
+        assert_eq!(msgs[2]["content"], "thanks!");
+        // The split guarantees the OpenAI serializer sees a Tool message
+        // (results) + a User message (text) — nothing to drop.
+    }
+
+    #[test]
+    fn response_with_image_serializes_as_image_block() {
+        let resp = NeutralResponse {
+            id: "r1".into(),
+            model: "claude".into(),
+            content: vec![
+                ContentBlock::Text("here is the badge:".into()),
+                ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    base64: "AAAA".into(),
+                },
+            ],
+            finish_reason: FinishReason::Stop,
+            usage: None,
+        };
+        let out = serialize_response(&resp).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["content"][0]["type"], "text");
+        assert_eq!(v["content"][1]["type"], "image");
+        assert_eq!(v["content"][1]["source"]["data"], "AAAA");
+    }
 
     #[test]
     fn parses_basic_request() {
@@ -614,7 +786,10 @@ mod tests {
             other => panic!("expected ToolUse, got {other:?}"),
         }
         let tool = &req.messages[1];
-        assert_eq!(tool.role, NeutralRole::User);
+        // Tool-result-bearing user messages normalize to the Tool role so
+        // serializers for every upstream protocol emit them as results
+        // (previously they were dropped, breaking the tool loop).
+        assert_eq!(tool.role, NeutralRole::Tool);
         assert_eq!(
             tool.content[0],
             ContentBlock::ToolResult {
@@ -655,6 +830,7 @@ mod tests {
                 parameters: json!({"type": "object"}),
             }],
             max_tokens: None,
+            max_completion_tokens: None,
             temperature: None,
             top_p: None,
             top_k: None,

@@ -39,11 +39,37 @@ default = ""
 prefixes = []
 
 [server]
-host = "0.0.0.0"
+# Loopback by default: bind a non-loopback interface only when you have
+# authentication (or another network boundary) in front of the gateway.
+host = "127.0.0.1"
 port = 5000
 
 [auth]
 # Accepted client API keys. Empty = all requests allowed. Requests must
 # present a key via `Authorization: Bearer <key>`, `api-key: <key>`, or
-# `x-api-key: <key>`. Key comparison is constant-time.
+# `x-api-key: <key>`. Key comparison is constant-time and bounded by the
+# longest configured key; empty/whitespace-only keys are rejected at startup.
 api_keys = []
+
+[privacy_guard]
+# Zero-trust reversible redaction. Disabled by default; when enabled, the
+# gateway replaces sensitive entities with tokens before forwarding and
+# restores them in the response, so the upstream provider never sees PII
+# and the client never sees tokens.
+enabled = false
+# Vault backend. Only "memory" (session-scoped, per-request) is
+# implemented; any other value is a startup error (fail closed).
+vault = "memory"
+
+# Custom rules are applied in order to every text-bearing content block.
+# When `rules` is empty and `enabled = true`, a built-in conservative set
+# is used (email, IPv4, US phone, API keys).
+# [[privacy_guard.rules]]
+# name = "INTERNAL_IP"
+# pattern = '\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b'
+# replacement = "<IP_{n}>"   # must contain {n}
+
+# Matches exempt from redaction.
+# [privacy_guard.allow_list]
+# domains = ["devstroop.com"]           # emails/URLs on these domains pass through
+# patterns = ['\bfoo@example\.com\b']   # regex-exempt matches

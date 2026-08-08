@@ -14,6 +14,8 @@
 //! - Finish reasons are uppercase (`STOP`, `MAX_TOKENS`, `SAFETY`, ...).
 //! - Usage is `usageMetadata {promptTokenCount, candidatesTokenCount}`.
 
+use std::collections::HashMap;
+
 use serde_json::{Map, Value, json};
 
 use crate::core::error::AdapterError;
@@ -43,10 +45,9 @@ pub fn parse_request(body: &str) -> Result<NeutralRequest, AdapterError> {
     }
 
     if let Some(contents) = root.get("contents").and_then(Value::as_array) {
+        let mut counter = 0u32;
         for content in contents {
-            if let Some(m) = parse_content(content) {
-                messages.push(m);
-            }
+            messages.extend(parse_content(content, &mut counter));
         }
     }
 
@@ -72,6 +73,7 @@ pub fn parse_request(body: &str) -> Result<NeutralRequest, AdapterError> {
             .get("maxOutputTokens")
             .and_then(Value::as_u64)
             .map(|v| v as u32),
+        max_completion_tokens: None,
         temperature: generation.get("temperature").and_then(Value::as_f64),
         top_p: generation.get("topP").and_then(Value::as_f64),
         top_k: generation
@@ -92,27 +94,65 @@ pub fn parse_request(body: &str) -> Result<NeutralRequest, AdapterError> {
     })
 }
 
-fn parse_content(content: &Value) -> Option<NeutralMessage> {
+fn parse_content(content: &Value, counter: &mut u32) -> Vec<NeutralMessage> {
     let role = match content.get("role").and_then(Value::as_str) {
         Some("user") => NeutralRole::User,
         Some("model") => NeutralRole::Assistant,
-        _ => return None,
+        _ => return Vec::new(),
     };
-    let blocks = parse_parts(content.get("parts").and_then(Value::as_array));
-    Some(NeutralMessage {
+    let blocks = parse_parts(content.get("parts").and_then(Value::as_array), counter);
+    if role == NeutralRole::User {
+        // Gemini sends tool results as functionResponse parts inside a
+        // `user` message. The other parsers normalize results into a
+        // NeutralRole::Tool message, and the OpenAI/Anthropic serializers
+        // drop ToolResult blocks that sit inside User messages — split so
+        // the tool loop survives routing through them.
+        let has_results = blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+        if has_results {
+            let results: Vec<ContentBlock> = blocks
+                .iter()
+                .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                .cloned()
+                .collect();
+            let rest: Vec<ContentBlock> = blocks
+                .into_iter()
+                .filter(|b| !matches!(b, ContentBlock::ToolResult { .. }))
+                .collect();
+            let mut out = Vec::new();
+            if !results.is_empty() {
+                out.push(NeutralMessage {
+                    role: NeutralRole::Tool,
+                    content: results,
+                });
+            }
+            if !rest.is_empty() {
+                out.push(NeutralMessage {
+                    role: NeutralRole::User,
+                    content: rest,
+                });
+            }
+            return out;
+        }
+    }
+    vec![NeutralMessage {
         role,
         content: blocks,
-    })
+    }]
 }
 
-fn parse_parts(parts: Option<&Vec<Value>>) -> Vec<ContentBlock> {
+fn parse_parts(parts: Option<&Vec<Value>>, counter: &mut u32) -> Vec<ContentBlock> {
     let Some(parts) = parts else {
         return Vec::new();
     };
-    parts.iter().filter_map(parse_part).collect()
+    parts
+        .iter()
+        .filter_map(|p| parse_part(p, counter))
+        .collect()
 }
 
-fn parse_part(part: &Value) -> Option<ContentBlock> {
+fn parse_part(part: &Value, counter: &mut u32) -> Option<ContentBlock> {
     if let Some(text) = part.get("text").and_then(Value::as_str) {
         // Thinking parts carry `thought: true` and no visible rendering
         // requirement; treat them as reasoning blocks.
@@ -143,12 +183,17 @@ fn parse_part(part: &Value) -> Option<ContentBlock> {
         });
     }
     if let Some(call) = part.get("functionCall") {
+        // Gemini functionCall parts carry no id in the classic API; mint a
+        // deterministic one per response so clients can correlate results.
+        let id = match call.get("id").and_then(Value::as_str) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => {
+                *counter += 1;
+                format!("fc_{counter}")
+            }
+        };
         return Some(ContentBlock::ToolUse {
-            id: call
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
+            id,
             name: call
                 .get("name")
                 .and_then(Value::as_str)
@@ -161,17 +206,40 @@ fn parse_part(part: &Value) -> Option<ContentBlock> {
         });
     }
     if let Some(resp) = part.get("functionResponse") {
+        // Classic Gemini functionResponse parts carry `name` + `response`,
+        // not `id`; the function name doubles as the correlation key, so
+        // fall back to it when no id is present.
+        let id = resp
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .or_else(|| resp.get("name").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string();
+        let response = resp.get("response");
+        let (content, is_error) = match response {
+            // Plain strings must NOT be JSON-encoded (`"22c"` with quotes
+            // would nest a level on every round trip).
+            Some(Value::String(s)) => (s.clone(), false),
+            Some(Value::Object(o)) => {
+                // Results sent through this gateway are wrapped as
+                // `{"result": "...", "is_error": bool}` by serialize —
+                // unwrap the wrapper so routing back through Gemini keeps
+                // both the payload and the error flag.
+                match (
+                    o.get("result").and_then(Value::as_str),
+                    o.get("is_error").and_then(Value::as_bool),
+                ) {
+                    (Some(result), is_err) => (result.to_string(), is_err.unwrap_or(false)),
+                    _ => (response.map(|r| r.to_string()).unwrap_or_default(), false),
+                }
+            }
+            other => (other.map(|r| r.to_string()).unwrap_or_default(), false),
+        };
         return Some(ContentBlock::ToolResult {
-            tool_use_id: resp
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            content: resp
-                .get("response")
-                .map(|r| r.to_string())
-                .unwrap_or_default(),
-            is_error: false,
+            tool_use_id: id,
+            content,
+            is_error,
         });
     }
     None
@@ -210,10 +278,42 @@ fn collect_text_parts(v: &Value) -> Vec<String> {
 pub fn serialize_request(req: &NeutralRequest) -> Result<String, AdapterError> {
     let mut root = Map::new();
 
+    // Pre-pass: correlate tool-call ids with function names so tool results
+    // can be emitted as `functionResponse` with the FUNCTION NAME (Gemini
+    // correlates by name, not id). Id-less calls (Gemini-originated) get a
+    // deterministic synthesized id (`fc_1`, `fc_2`, ...) from a
+    // REQUEST-SCOPED counter — matching the parsers — so ids stay unique
+    // across messages and clients can correlate results.
+    let mut call_names: HashMap<String, String> = HashMap::new();
+    // Reverse map: function name → id of the (first) call with that name.
+    // Lets a name-keyed `functionResponse` (the classic Gemini shape, which
+    // carries no id) be correlated back to the call the client saw.
+    let mut id_by_name: HashMap<String, String> = HashMap::new();
+    let mut synth_ids: HashMap<(usize, usize), String> = HashMap::new();
+    let mut counter = 0u32;
+    for (mi, msg) in req.messages.iter().enumerate() {
+        for (bi, block) in msg.content.iter().enumerate() {
+            if let ContentBlock::ToolUse { id, name, .. } = block {
+                let key = if id.is_empty() {
+                    counter += 1;
+                    let key = format!("fc_{counter}");
+                    synth_ids.insert((mi, bi), key.clone());
+                    key
+                } else {
+                    id.clone()
+                };
+                call_names
+                    .entry(key.clone())
+                    .or_insert_with(|| name.clone());
+                id_by_name.entry(name.clone()).or_insert(key);
+            }
+        }
+    }
+
     let mut contents: Vec<Value> = Vec::new();
     let mut system_text: Vec<String> = Vec::new();
 
-    for msg in &req.messages {
+    for (mi, msg) in req.messages.iter().enumerate() {
         match msg.role {
             NeutralRole::System => {
                 system_text.extend(
@@ -228,7 +328,12 @@ pub fn serialize_request(req: &NeutralRequest) -> Result<String, AdapterError> {
                     NeutralRole::User => "user",
                     _ => "model",
                 };
-                let parts: Vec<Value> = msg.content.iter().filter_map(serialize_part).collect();
+                let parts: Vec<Value> = msg
+                    .content
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(bi, b)| serialize_part(b, synth_ids.get(&(mi, bi))))
+                    .collect();
                 if !parts.is_empty() {
                     contents.push(json!({ "role": role, "parts": parts }));
                 }
@@ -243,16 +348,34 @@ pub fn serialize_request(req: &NeutralRequest) -> Result<String, AdapterError> {
                             tool_use_id,
                             content,
                             is_error,
-                        } => Some(json!({
-                            "functionResponse": {
-                                "id": tool_use_id,
-                                "name": tool_use_id,
-                                "response": {
+                        } => {
+                            // The response must carry the FUNCTION NAME for
+                            // Gemini to correlate it with the original call.
+                            // Prefer id-keyed lookup; fall back to a
+                            // name-keyed lookup (classic Gemini function
+                            // responses carry only the name); last resort:
+                            // treat the id as the name.
+                            let (call_id, name) = if let Some(n) = call_names.get(tool_use_id) {
+                                (Some(tool_use_id.clone()), n.clone())
+                            } else if let Some(id) = id_by_name.get(tool_use_id) {
+                                (Some(id.clone()), tool_use_id.clone())
+                            } else {
+                                (None, tool_use_id.clone())
+                            };
+                            let mut fr = Map::new();
+                            if let Some(id) = call_id {
+                                fr.insert("id".to_string(), json!(id));
+                            }
+                            fr.insert("name".to_string(), json!(name));
+                            fr.insert(
+                                "response".to_string(),
+                                json!({
                                     "result": content,
                                     "is_error": is_error,
-                                },
-                            },
-                        })),
+                                }),
+                            );
+                            Some(json!({ "functionResponse": fr }))
+                        }
                         _ => None,
                     })
                     .collect();
@@ -282,8 +405,8 @@ pub fn serialize_request(req: &NeutralRequest) -> Result<String, AdapterError> {
     }
 
     let mut generation = Map::new();
-    if let Some(mt) = req.max_tokens {
-        generation.insert("maxOutputTokens".to_string(), json!(mt));
+    if let Some(max_tokens) = req.max_tokens.or(req.max_completion_tokens) {
+        generation.insert("maxOutputTokens".to_string(), json!(max_tokens));
     }
     if let Some(t) = req.temperature {
         generation.insert("temperature".to_string(), json!(t));
@@ -307,7 +430,7 @@ pub fn serialize_request(req: &NeutralRequest) -> Result<String, AdapterError> {
     serde_json::to_string(&Value::Object(root)).map_err(|e| AdapterError::Internal(e.to_string()))
 }
 
-fn serialize_part(block: &ContentBlock) -> Option<Value> {
+fn serialize_part(block: &ContentBlock, synth_id: Option<&String>) -> Option<Value> {
     match block {
         ContentBlock::Text(t) => Some(json!({ "text": t })),
         ContentBlock::Image { media_type, base64 } => Some(json!({
@@ -317,10 +440,20 @@ fn serialize_part(block: &ContentBlock) -> Option<Value> {
             "text": thinking,
             "thought": true,
         })),
-        ContentBlock::ToolUse { id, name, input } => Some(json!({
-            "functionCall": { "id": id, "name": name, "args": input },
-        })),
-        ContentBlock::ToolResult { .. } => None, // handled at message level
+        ContentBlock::ToolUse { id, name, input } => {
+            // Gemini functionCall parts carry an optional id; id-less calls
+            // (Gemini-originated) use the synthesized id from the pre-pass.
+            let mut call = Map::new();
+            let call_id = synth_id.map(String::as_str).unwrap_or(id.as_str());
+            if !call_id.is_empty() {
+                call.insert("id".to_string(), json!(call_id));
+            }
+            call.insert("name".to_string(), json!(name));
+            call.insert("args".to_string(), input.clone());
+            Some(json!({ "functionCall": call }))
+        }
+        ContentBlock::RedactedThinking { .. } => None, // no Gemini equivalent
+        ContentBlock::ToolResult { .. } => None,       // handled at message level
     }
 }
 
@@ -362,7 +495,11 @@ pub fn parse_response(body: &str) -> Result<NeutralResponse, AdapterError> {
             .and_then(|c| c.get("parts"))
             .and_then(Value::as_array)
         {
-            content = parts.iter().filter_map(parse_part).collect();
+            let mut counter = 0u32;
+            content = parts
+                .iter()
+                .filter_map(|p| parse_part(p, &mut counter))
+                .collect();
         }
         if let Some(fr) = candidate.get("finishReason").and_then(Value::as_str) {
             finish_reason = parse_finish_reason(fr);
@@ -408,7 +545,11 @@ fn parse_usage(usage: &Value) -> Option<NeutralUsage> {
 
 /// Serialize a neutral response into a Gemini `generateContent` body.
 pub fn serialize_response(resp: &NeutralResponse) -> Result<String, AdapterError> {
-    let parts: Vec<Value> = resp.content.iter().filter_map(serialize_part).collect();
+    let parts: Vec<Value> = resp
+        .content
+        .iter()
+        .filter_map(|b| serialize_part(b, None))
+        .collect();
     let mut root = Map::new();
     root.insert(
         "candidates".to_string(),
@@ -466,6 +607,58 @@ pub fn serialize_error(err: &AdapterError) -> (u16, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_function_response_message_and_wrapper_round_trip() {
+        // (a) A user message mixing text + functionResponse splits into a
+        // Tool message (results) and a User message (text) so the
+        // OpenAI/Anthropic serializers do not drop the results.
+        let body = r#"{
+            "model": "gemini-2.5-flash",
+            "contents": [
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "get_weather", "args": {"city": "paris"}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"text": "thanks!"},
+                    {"functionResponse": {"name": "get_weather", "response": "22c"}}
+                ]}
+            ]
+        }"#;
+        let req = parse_request(body).unwrap();
+        assert_eq!(req.messages.len(), 3, "mixed message splits into two");
+        assert_eq!(req.messages[1].role, NeutralRole::Tool);
+        match &req.messages[1].content[0] {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert_eq!(content, "22c", "string responses must NOT be JSON-quoted");
+                assert!(!is_error);
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+        assert_eq!(req.messages[2].role, NeutralRole::User);
+        // (b) The gateway's own {"result": ..., "is_error": ...} wrapper
+        // unwraps on a second parse: no nesting, error flag preserved.
+        let wrapped_body = r#"{
+            "model": "gemini-2.5-flash",
+            "contents": [
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "get_weather", "response": {"result": "oops 500", "is_error": true}}}
+                ]}
+            ]
+        }"#;
+        let req2 = parse_request(wrapped_body).unwrap();
+        match &req2.messages[0].content[0] {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert_eq!(content, "oops 500");
+                assert!(*is_error);
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
 
     #[test]
     fn parses_basic_request_with_system_and_generation_config() {
@@ -615,6 +808,7 @@ mod tests {
                 parameters: json!({"type": "object"}),
             }],
             max_tokens: Some(128),
+            max_completion_tokens: None,
             temperature: None,
             top_p: None,
             top_k: None,
@@ -702,5 +896,224 @@ mod tests {
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["error"]["status"], "RESOURCE_EXHAUSTED");
         assert_eq!(v["error"]["code"], 429);
+    }
+
+    #[test]
+    fn synthesized_call_ids_unique_across_messages() {
+        // The synth counter is request-scoped: id-less calls in different
+        // messages must not all become fc_1.
+        let req = NeutralRequest {
+            model: String::new(),
+            messages: vec![
+                NeutralMessage {
+                    role: NeutralRole::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: String::new(),
+                        name: "f1".into(),
+                        input: json!({}),
+                    }],
+                },
+                NeutralMessage {
+                    role: NeutralRole::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: String::new(),
+                        name: "f2".into(),
+                        input: json!({}),
+                    }],
+                },
+            ],
+            tools: vec![],
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: None,
+            stream: false,
+        };
+        let out = serialize_request(&req).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["contents"][0]["parts"][0]["functionCall"]["id"], "fc_1");
+        assert_eq!(v["contents"][1]["parts"][0]["functionCall"]["id"], "fc_2");
+    }
+
+    #[test]
+    fn function_response_parses_name_when_id_missing() {
+        // Classic Gemini functionResponse parts carry `name` + `response`
+        // (no `id`); the name is the correlation key.
+        let body = r#"{
+            "contents": [{"role": "user", "parts": [
+                {"functionResponse": {"name": "get_weather", "response": {"result": "22c"}}}
+            ]}]
+        }"#;
+        let req = parse_request(body).unwrap();
+        match &req.messages[0].content[0] {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "get_weather");
+                assert!(content.contains("22c"));
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn name_keyed_tool_result_correlates_via_reverse_map() {
+        // A Gemini-originated round trip: id-less functionCall, then a
+        // functionResponse carrying only the function name. Serializing
+        // must re-emit a well-formed functionResponse with BOTH the
+        // function name (Gemini's correlation key) and the call id the
+        // client saw.
+        let req = NeutralRequest {
+            model: "m".into(),
+            messages: vec![
+                NeutralMessage {
+                    role: NeutralRole::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call_1".into(),
+                        name: "get_weather".into(),
+                        input: json!({}),
+                    }],
+                },
+                NeutralMessage {
+                    role: NeutralRole::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "get_weather".into(),
+                        content: "22c".into(),
+                        is_error: false,
+                    }],
+                },
+            ],
+            tools: vec![],
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: None,
+            stream: false,
+        };
+        let out = serialize_request(&req).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let fr = &v["contents"][1]["parts"][0]["functionResponse"];
+        assert_eq!(fr["name"], "get_weather");
+        assert_eq!(fr["id"], "call_1");
+    }
+
+    #[test]
+    fn tool_result_serializes_function_name_from_history() {
+        // Gemini's functionResponse correlates by FUNCTION NAME, not the
+        // tool-call id — the name must come from the assistant message.
+        let req = NeutralRequest {
+            model: String::new(),
+            messages: vec![
+                NeutralMessage {
+                    role: NeutralRole::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call_1".into(),
+                        name: "get_weather".into(),
+                        input: json!({"city": "paris"}),
+                    }],
+                },
+                NeutralMessage {
+                    role: NeutralRole::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_1".into(),
+                        content: "22c".into(),
+                        is_error: false,
+                    }],
+                },
+            ],
+            tools: vec![],
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: None,
+            stream: false,
+        };
+        let out = serialize_request(&req).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let fr = &v["contents"][1]["parts"][0]["functionResponse"];
+        assert_eq!(fr["name"], "get_weather");
+        assert_eq!(fr["id"], "call_1");
+    }
+
+    #[test]
+    fn tool_result_with_unknown_id_falls_back_to_id() {
+        // When the history carries no matching tool call, the id is used as
+        // a last-resort name so the request is still well-formed.
+        let req = NeutralRequest {
+            model: String::new(),
+            messages: vec![NeutralMessage {
+                role: NeutralRole::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "ghost_1".into(),
+                    content: "x".into(),
+                    is_error: false,
+                }],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: None,
+            stream: false,
+        };
+        let out = serialize_request(&req).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["contents"][0]["parts"][0]["functionResponse"]["name"],
+            "ghost_1"
+        );
+    }
+
+    #[test]
+    fn synthesizes_id_for_idless_function_call_in_request() {
+        // Gemini-originated calls carry no id; the gateway mints a
+        // deterministic one so clients can correlate results.
+        let req = NeutralRequest {
+            model: String::new(),
+            messages: vec![NeutralMessage {
+                role: NeutralRole::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: String::new(),
+                    name: "f".into(),
+                    input: json!({"a": 1}),
+                }],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: None,
+            stream: false,
+        };
+        let out = serialize_request(&req).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["contents"][0]["parts"][0]["functionCall"]["id"], "fc_1");
+    }
+
+    #[test]
+    fn synthesizes_id_for_idless_function_call_in_response() {
+        let body = r#"{"candidates":[{"content":{"role":"model","parts":[
+            {"functionCall":{"name":"get_weather","args":{"city":"paris"}}}
+        ]}}]}"#;
+        let resp = parse_response(body).unwrap();
+        match &resp.content[0] {
+            ContentBlock::ToolUse { id, name, .. } => {
+                assert_eq!(id, "fc_1");
+                assert_eq!(name, "get_weather");
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
     }
 }

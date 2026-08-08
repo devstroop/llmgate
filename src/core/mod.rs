@@ -3,6 +3,7 @@
 pub mod error;
 pub mod neutral;
 pub mod pipeline;
+pub mod privacy;
 pub mod registry;
 pub mod sse;
 
@@ -12,4 +13,5 @@ pub use neutral::{
     NeutralRole, NeutralStreamEvent, NeutralTool, NeutralUsage,
 };
 pub use pipeline::AppState;
+pub use privacy::{PrivacyConfig, RedactionEngine, RedactionSession, StreamRestorer};
 pub use registry::{EndpointKind, ProtocolAdapter, ProtocolRegistry, StreamDecoder, StreamEncoder};

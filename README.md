@@ -1,7 +1,9 @@
-# model-adapter
+# llmgate
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/devstroop/model-adapter/actions/workflows/ci.yml/badge.svg)](https://github.com/devstroop/model-adapter/actions/workflows/ci.yml)
+
+The zero-trust gateway for LLMs. It sits between your applications and cloud AI providers, translating across LLM protocols and inspecting every token in real time. Redact sensitive data, cache responses, and route requests across models and providers—all before your data reaches the cloud.
 
 Protocol-agnostic LLM API adapter gateway in Rust.
 
@@ -51,6 +53,12 @@ Anthropic client ──▶ /v1/messages ───────┘                
 - **JSON-as-stream fallback** — if an upstream ignores `stream: true` and
   answers with plain JSON, the body is converted into a single-event stream
   instead of an empty stream.
+- **Privacy Guard (zero-trust redaction)** — reversible, session-scoped
+  pseudonymization at the gateway boundary: PII, IPs, secrets, and custom
+  rule matches are replaced with tokens (`<EMAIL_1>`, `<IP_2>`, ...) before
+  the request leaves the gateway and restored transparently in the
+  response — streaming or not. The upstream provider never sees sensitive
+  data; the client never sees tokens. See [Privacy Guard](#privacy-guard).
 
 ## Quick start
 
@@ -101,14 +109,20 @@ comments. Sections: `[client]` (protocols served), `[upstream]` (protocol,
 URL, auth headers, timeout), `[models]` (default, map, prefixes), `[server]`
 (bind host/port), `[auth]` (client API keys).
 
-`CONFIG_PATH` env var overrides the config file location (default `./config.toml`);
-if no file exists, defaults are used.
+`CONFIG_PATH` env var overrides the config file location (default `./config.toml`).
+When `CONFIG_PATH` is **unset** and no `config.toml` exists, built-in defaults
+are used (loopback-only bind, no auth — see below). When `CONFIG_PATH` is set
+but the file is missing, startup **aborts**: the gateway never silently runs
+in the unauthenticated default configuration.
 
 Timeout semantics: `upstream.timeout_ms` (default 60s) bounds **non-streaming**
 requests (conversations and model listings). **Streaming** requests have no
 total timeout — the stream is bounded by the SSE protocol itself
 (`[DONE]` / `message_stop` / connection close) so long generations are not cut
-off. TCP connect timeout is a fixed 10s.
+off, with a 120s per-chunk idle timeout and a 15s bound on waiting for the
+upstream's response headers. TCP connect timeout is a fixed 10s. Upstream
+redirects are NEVER followed (credentials could be leaked to the redirect
+target); a redirecting upstream is an error.
 
 ### Gemini upstream
 
@@ -119,6 +133,63 @@ set the API key via `[[upstream.extra_headers]]` (`x-goog-api-key`) or
 segment (`:generateContent` / `:streamGenerateContent?alt=sse`), so
 `[models.map]` entries should map client model names to Gemini model ids (e.g.
 `"gpt-4o" = "gemini-2.5-flash"`).
+
+### Privacy Guard
+
+The **Zero-Trust LLM Gateway**: route requests to any cloud LLM without ever
+exposing PII, IPs, or secrets to the provider. When enabled, the gateway
+replaces sensitive entities in the inbound request with synthetic tokens
+(`<EMAIL_1>`, `<IP_2>`, `<SECRET_3>`, ...), forwards the sanitized request
+upstream, and restores the original values as the response streams back —
+the client experiences zero degradation, the provider learns nothing.
+
+```toml
+[privacy_guard]
+enabled = true
+vault = "memory"   # only "memory" (session-scoped) is implemented
+
+# Custom rules (when omitted, a built-in conservative set is used: email,
+# IPv4, US phone, API keys).
+[[privacy_guard.rules]]
+name = "INTERNAL_IP"
+pattern = '\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b'
+replacement = "<IP_{n}>"
+
+[privacy_guard.allow_list]
+domains = ["devstroop.com"]        # emails/URLs on these domains pass through
+patterns = ['\bfoo@example\.com\b'] # regex-exempt matches
+```
+
+How it works:
+
+- **Rules are regex-driven and order-sensitive** — every text-bearing content
+  block (text, thinking, tool results, tool-call input JSON) is scanned per
+  rule. Repeated values reuse one token so the model sees a consistent symbol
+  per entity.
+- **Restore is exact and streaming-safe** — tokens use the `<NAME_n>`
+  grammar (`>` terminator), so `<IP_1>` can never match inside `<IP_10>`.
+  Response streams are restored with a buffered Aho-Corasick matcher that
+  reassembles tokens split across arbitrary SSE chunk boundaries, per channel
+  (text / reasoning / tool arguments).
+- **Allow-lists** — domains and regexes that must never be redacted
+  (e.g. your own company domain).
+- **Session-scoped vault** — token mappings live in memory exactly as long
+  as the request; they are dropped when the response finishes. Nothing is
+  persisted.
+- **Fails closed** — an invalid rule pattern, replacement template (must
+  contain `{n}`), or vault backend prevents startup rather than silently
+  running unredacted.
+- **Memory note** — redaction works on a request clone (so a cap-exhausted
+  request is rejected atomically, never partially redacted): peak memory
+  for privacy-enabled requests is ~2x the request size (up to ~32 MiB at
+  the 16 MiB inbound cap). Account for that when enabling the guard on
+  memory-constrained hosts.
+
+Scope notes (v1): image blocks are not redacted (no OCR/vision pass), tool
+*definitions* are not scanned, and there is a 4096-token cap per session —
+a request that exhausts the cap is **rejected** (fail closed): the provider
+never receives the unredacted tail. A persistent vault backend (e.g. sqlite)
+is a future extension; the session API is the seam.
 
 ## Project layout
 
@@ -153,21 +224,27 @@ it. The core does not change.
 2. **`endpoints()`** — inbound paths served to clients with their
    `EndpointKind` (`Chat`, `Messages`, `Models`, `CountTokens`).
 3. **`conversation_url()`** — upstream URL from the provider base; the `model`
-   argument supports path-parameterized protocols (e.g. Gemini).
-4. **`request_headers()`** — protocol-required upstream headers
+   argument supports path-parameterized protocols (e.g. Gemini). Returns
+   `Result` so path-injection attempts and invalid models can be rejected.
+4. **`stream_conversation_url()`** — default `conversation_url()`, overridden
+   by protocols whose streaming endpoint differs (e.g. Gemini's
+   `:streamGenerateContent?alt=sse`).
+5. **`request_headers()`** — protocol-required upstream headers
    (e.g. `anthropic-version`).
-5. **`parse_request` / `serialize_request`** — inbound body ↔ `NeutralRequest`.
+6. **`parse_request` / `serialize_request`** — inbound body ↔ `NeutralRequest`.
    The neutral model uses content blocks (text / image / thinking /
-   tool_use / tool_result), so any block-based protocol maps directly.
-6. **`parse_response` / `serialize_response`** — upstream body ↔
+   redacted_thinking / tool_use / tool_result), so any block-based protocol
+   maps directly.
+7. **`parse_response` / `serialize_response`** — upstream body ↔
    `NeutralResponse` (content blocks + finish_reason + usage).
-7. **`stream_decoder()` / `stream_encoder()`** — stateful SSE conversion.
+8. **`stream_decoder()` / `stream_encoder()`** — stateful SSE conversion.
    Decoder: upstream SSE payload → `NeutralStreamEvent`s; the pipeline feeds
    it with framing already applied. Encoder: event → client SSE lines.
-8. **`serialize_error()`** — `AdapterError` → native error body + status.
-9. **`parse_models` / `serialize_models`** — optional model listing support;
-   the default `parse_models` handles the common `{"data":[{id,...}]}` shape.
-10. **Register** in `src/main.rs` and add the name to `[client]`/`[upstream]`.
+9. **`serialize_error()`** — `AdapterError` → native error body + status.
+10. **`parse_models` / `serialize_models`** — optional model listing support;
+    the default `parse_models` handles the common `{"data":[{id,...}]}` shape.
+11. **Register** in `src/adapters/mod.rs` and `src/main.rs`, and add the name
+    to `[client]`/`[upstream]`.
 
 `NeutralStreamEvent` is deliberately coarse (`MessageStart`, `TextDelta`,
 `ReasoningDelta`, `ToolCallDelta`, `MessageStop`); adapters accumulate

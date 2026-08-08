@@ -63,6 +63,12 @@ pub fn parse_request(body: &str) -> Result<NeutralRequest, AdapterError> {
             .get("max_tokens")
             .and_then(Value::as_u64)
             .map(|v| v as u32),
+        // Prefer max_completion_tokens (the field reasoning models accept);
+        // the serializer re-emits whichever field the client used.
+        max_completion_tokens: root
+            .get("max_completion_tokens")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32),
         temperature: root.get("temperature").and_then(Value::as_f64),
         top_p: root.get("top_p").and_then(Value::as_f64),
         top_k: None,
@@ -227,7 +233,7 @@ pub fn serialize_request(req: &NeutralRequest) -> Result<String, AdapterError> {
     root.insert("model".to_string(), Value::String(req.model.clone()));
     root.insert(
         "messages".to_string(),
-        Value::Array(req.messages.iter().filter_map(serialize_message).collect()),
+        Value::Array(req.messages.iter().flat_map(serialize_message).collect()),
     );
     if !req.tools.is_empty() {
         root.insert(
@@ -235,7 +241,9 @@ pub fn serialize_request(req: &NeutralRequest) -> Result<String, AdapterError> {
             Value::Array(req.tools.iter().map(serialize_tool).collect()),
         );
     }
-    if let Some(mt) = req.max_tokens {
+    if let Some(mc) = req.max_completion_tokens {
+        root.insert("max_completion_tokens".to_string(), json!(mc));
+    } else if let Some(mt) = req.max_tokens {
         root.insert("max_tokens".to_string(), json!(mt));
     }
     if let Some(t) = req.temperature {
@@ -260,7 +268,7 @@ pub fn serialize_request(req: &NeutralRequest) -> Result<String, AdapterError> {
     serde_json::to_string(&Value::Object(root)).map_err(|e| AdapterError::Internal(e.to_string()))
 }
 
-fn serialize_message(msg: &NeutralMessage) -> Option<Value> {
+fn serialize_message(msg: &NeutralMessage) -> Vec<Value> {
     let role = match msg.role {
         NeutralRole::System => "system",
         NeutralRole::User => "user",
@@ -270,51 +278,60 @@ fn serialize_message(msg: &NeutralMessage) -> Option<Value> {
 
     match msg.role {
         NeutralRole::Tool => {
-            let block = msg.content.iter().find_map(|b| match b {
-                ContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    ..
-                } => Some((tool_use_id, content)),
-                _ => None,
-            })?;
-            Some(json!({
-                "role": "tool",
-                "tool_call_id": block.0,
-                "content": block.1,
-            }))
+            // One OpenAI "tool" message per tool result (each carries a
+            // single tool_call_id); a multi-result Anthropic message must
+            // not collapse into one.
+            msg.content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } => Some(json!({
+                        "role": "tool",
+                        "tool_call_id": tool_use_id,
+                        "content": content,
+                    })),
+                    _ => None,
+                })
+                .collect()
         }
         NeutralRole::System | NeutralRole::User => {
-            let text: Vec<String> = msg
+            let has_images = msg
                 .content
                 .iter()
-                .filter_map(ContentBlock::text)
-                .map(String::from)
-                .collect();
-            let images: Vec<&ContentBlock> = msg
-                .content
-                .iter()
-                .filter(|b| matches!(b, ContentBlock::Image { .. }))
-                .collect();
-            if images.is_empty() {
-                Some(json!({
+                .any(|b| matches!(b, ContentBlock::Image { .. }));
+            if !has_images {
+                let text: Vec<String> = msg
+                    .content
+                    .iter()
+                    .filter_map(ContentBlock::text)
+                    .map(String::from)
+                    .collect();
+                vec![json!({
                     "role": role,
                     "content": text.join("\n"),
-                }))
+                })]
             } else {
+                // Preserve text/image interleaving order: emit one part
+                // per block as encountered, not grouped by type.
                 let mut parts: Vec<Value> = Vec::new();
-                for t in text {
-                    parts.push(json!({ "type": "text", "text": t }));
-                }
-                for img in images {
-                    if let ContentBlock::Image { media_type, base64 } = img {
-                        parts.push(json!({
-                            "type": "image_url",
-                            "image_url": { "url": image_to_url(media_type, base64) },
-                        }));
+                for block in &msg.content {
+                    match block {
+                        ContentBlock::Text(t) => {
+                            parts.push(json!({ "type": "text", "text": t }));
+                        }
+                        ContentBlock::Image { media_type, base64 } => {
+                            parts.push(json!({
+                                "type": "image_url",
+                                "image_url": { "url": image_to_url(media_type, base64) },
+                            }));
+                        }
+                        _ => {}
                     }
                 }
-                Some(json!({ "role": role, "content": parts }))
+                vec![json!({ "role": role, "content": parts })]
             }
         }
         NeutralRole::Assistant => {
@@ -360,7 +377,7 @@ fn serialize_message(msg: &NeutralMessage) -> Option<Value> {
             if !tool_calls.is_empty() {
                 m.insert("tool_calls".to_string(), Value::Array(tool_calls));
             }
-            Some(Value::Object(m))
+            vec![Value::Object(m)]
         }
     }
 }
@@ -507,6 +524,10 @@ pub fn serialize_response(resp: &NeutralResponse) -> Result<String, AdapterError
 
     let mut message = Map::new();
     message.insert("role".to_string(), Value::String("assistant".to_string()));
+    let has_images = resp
+        .content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::Image { .. }));
     let text: Vec<String> = resp
         .content
         .iter()
@@ -536,7 +557,24 @@ pub fn serialize_response(resp: &NeutralResponse) -> Result<String, AdapterError
             _ => None,
         })
         .collect();
-    message.insert("content".to_string(), Value::String(text.join("\n")));
+    if has_images {
+        // Model-generated images (e.g. Gemini inlineData) survive as
+        // multimodal content parts instead of vanishing silently.
+        let mut parts: Vec<Value> = Vec::new();
+        for block in &resp.content {
+            match block {
+                ContentBlock::Text(t) => parts.push(json!({ "type": "text", "text": t })),
+                ContentBlock::Image { media_type, base64 } => parts.push(json!({
+                    "type": "image_url",
+                    "image_url": { "url": image_to_url(media_type, base64) },
+                })),
+                _ => {}
+            }
+        }
+        message.insert("content".to_string(), Value::Array(parts));
+    } else {
+        message.insert("content".to_string(), Value::String(text.join("\n")));
+    }
     if !reasoning.is_empty() {
         message.insert(
             "reasoning_content".to_string(),
@@ -732,6 +770,140 @@ mod tests {
     }
 
     #[test]
+    fn max_completion_tokens_round_trips() {
+        // The client's token-limit field must be preserved: reasoning
+        // models reject `max_tokens`, so serializing back the field the
+        // client used matters.
+        let body = r#"{"model":"o3-mini","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":500}"#;
+        let req = parse_request(body).unwrap();
+        assert_eq!(req.max_completion_tokens, Some(500));
+        assert_eq!(req.max_tokens, None);
+        let out = serialize_request(&req).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["max_completion_tokens"], 500);
+        assert!(
+            v.get("max_tokens").is_none(),
+            "max_tokens must not be emitted when the client used max_completion_tokens"
+        );
+    }
+
+    #[test]
+    fn multimodal_blocks_keep_interleaved_order() {
+        let req = NeutralRequest {
+            model: "m".into(),
+            messages: vec![NeutralMessage {
+                role: NeutralRole::User,
+                content: vec![
+                    ContentBlock::Text("what is in this image?".into()),
+                    ContentBlock::Image {
+                        media_type: "image/png".into(),
+                        base64: "AA==".into(),
+                    },
+                    ContentBlock::Text("and this one?".into()),
+                    ContentBlock::Image {
+                        media_type: "image/png".into(),
+                        base64: "BB==".into(),
+                    },
+                ],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: None,
+            stream: false,
+        };
+        let out = serialize_request(&req).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let parts = v["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 4, "text/image interleaving must be preserved");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[2]["type"], "text");
+        assert_eq!(parts[3]["type"], "image_url");
+        assert!(
+            parts[1]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .ends_with("AA==")
+        );
+        assert!(
+            parts[3]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .ends_with("BB==")
+        );
+    }
+
+    #[test]
+    fn tool_role_emits_one_message_per_result() {
+        let req = NeutralRequest {
+            model: "m".into(),
+            messages: vec![NeutralMessage {
+                role: NeutralRole::Tool,
+                content: vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call_1".into(),
+                        content: "22c".into(),
+                        is_error: false,
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call_2".into(),
+                        content: "paris".into(),
+                        is_error: false,
+                    },
+                ],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: None,
+            stream: false,
+        };
+        let out = serialize_request(&req).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "one OpenAI tool message per result");
+        assert_eq!(msgs[0]["tool_call_id"], "call_1");
+        assert_eq!(msgs[1]["tool_call_id"], "call_2");
+        assert_eq!(msgs[1]["content"], "paris");
+    }
+
+    #[test]
+    fn response_images_serialize_as_content_parts() {
+        let resp = NeutralResponse {
+            id: "r1".into(),
+            model: "m".into(),
+            content: vec![
+                ContentBlock::Text("badge:".into()),
+                ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    base64: "AAAA".into(),
+                },
+            ],
+            finish_reason: FinishReason::Stop,
+            usage: None,
+        };
+        let out = serialize_response(&resp).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let parts = v["choices"][0]["message"]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2, "images must not be dropped");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert!(
+            parts[1]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .ends_with("AAAA")
+        );
+    }
+
+    #[test]
     fn serialize_round_trips_tools_and_images() {
         let req = NeutralRequest {
             model: "m".into(),
@@ -761,6 +933,7 @@ mod tests {
                 parameters: json!({"type": "object"}),
             }],
             max_tokens: Some(100),
+            max_completion_tokens: None,
             temperature: None,
             top_p: None,
             top_k: None,
