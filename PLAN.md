@@ -132,6 +132,11 @@ Work in `src/adapters/*/` — the tables below live inside each adapter, not the
 | M7 | Reliability hardening | Done. Spec-faithful thinking blocks, timeout split, SSE keep-alive + proxy headers, bounded SSE buffering, constant-time auth, request-id tracing, JSON-as-stream fallback. |
 | M8 | gemini adapter | Done. Upstream-side `generateContent` adapter: request/response conversion (tools, thinking, images), SSE stream decoder/encoder, error mapping, model listing, `streamGenerateContent` URL switching. |
 | M9 | Privacy Guard | Done. Reversible redaction (`[privacy_guard]`): regex rules + allow-list, session-scoped token vault, streaming restore across fragmented SSE chunks (buffered Aho-Corasick, per channel), fail-closed config validation. |
+| M10 | Memory substrate & observability | Planned. `[memory]` config (fail-closed), embedded nqlite store behind a write-behind actor, per-request records (model, usage, latency, status, request-id) for stream + non-stream paths, TTL purge, `nql-cli` admin queries. |
+| M11 | Persistent PII vault | Planned. Opt-in nqlite vault backend for Privacy Guard (cross-request restore + crash recovery); all M9 invariants must stay green. |
+| M12 | Response cache | Planned. Exact + BM25 fuzzy tier first (no embeddings); vector tier behind an `Embedder` trait; TTL/eviction; non-stream first, stream replay later. |
+| M13 | Session context engine | Planned. `x-session-id` contract (stripped before upstream), turn graph (`:next`/`:mentions`), salience recall injected as token-budgeted system context. |
+| M14 | Multi-upstream failover | Planned. Pre-first-token re-route to a fallback upstream; token-exact mid-stream resume experimental. |
 
 ### M1 details
 
@@ -225,7 +230,7 @@ now be routed to a Gemini provider:
 
 ## Verification
 
-- `cargo test` — 95 unit tests: per-adapter conversion/stream tests (openai,
+- `cargo test` — 165 unit tests: per-adapter conversion/stream tests (openai,
   anthropic, gemini) + core (sse framing incl. buffer cap, auth incl.
   constant-time, config, resolver) + privacy guard (redaction, allow-list,
   round-trips, fragmented stream restore, prefix-collision safety, token
@@ -235,9 +240,16 @@ now be routed to a Gemini provider:
 - Manual curl smoke tests for both protocols (stream + non-stream, tools,
   auth, models).
 
+## Backlog
+
+- Client-side Gemini inbound (`/v1beta/models/{model}:generateContent` needs
+  path-parameterized routing) — follow-up to M8 (Gemini is upstream-only today).
+
 ## Out of scope (for now)
 
-- Embeddings / moderations / audio endpoints (sidecars etc.)
+- Embeddings for generation / moderations / audio endpoints (sidecars etc.)
 - Exact (non-heuristic) token counting, rate limiting, per-user budgets
-- Multi-upstream routing / load balancing / failover
 - Warpgate-style egress proxy pools
+- (Multi-upstream routing / failover and response caching are NOT out of
+  scope — they land via M10–M14, the nqlite memory initiative. See
+  `/root/workspace/llmgate-nqlite-scope.md`.)
