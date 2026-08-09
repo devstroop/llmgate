@@ -583,6 +583,7 @@ dependencies = [
 [[package]]
 name = "nql"
 version = "0.1.0"
+source = "git+https://github.com/devstroop/nqlite?rev=3c2b5e1076a628f7d7c124739b9a96a0b08d7b10#3c2b5e1076a628f7d7c124739b9a96a0b08d7b10"
 dependencies = [
  "nql-ir",
  "serde",
@@ -592,6 +593,7 @@ dependencies = [
 [[package]]
 name = "nql-ir"
 version = "0.1.0"
+source = "git+https://github.com/devstroop/nqlite?rev=3c2b5e1076a628f7d7c124739b9a96a0b08d7b10#3c2b5e1076a628f7d7c124739b9a96a0b08d7b10"
 dependencies = [
  "serde",
 ]
@@ -599,6 +601,7 @@ dependencies = [
 [[package]]
 name = "nqlite"
 version = "0.1.0"
+source = "git+https://github.com/devstroop/nqlite?rev=3c2b5e1076a628f7d7c124739b9a96a0b08d7b10#3c2b5e1076a628f7d7c124739b9a96a0b08d7b10"
 dependencies = [
  "crc32fast",
  "nql",
