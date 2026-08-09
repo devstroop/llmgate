@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Observability store (M10)** — optional `[memory]` section: every request
+  is recorded as a JSON document (model, protocols, mode, status, latency,
+  token usage, request-id) in an embedded nqlite database behind a
+  write-behind actor; WAL checkpoint cadence and TTL sweep are configurable;
+  queryable offline with `nql-cli`. Disabled by default; fail-closed
+  validation (`enabled` requires `path`; unopenable database aborts startup).
 - **Community-standard docs** — `CODE_OF_CONDUCT.md` (Contributor Covenant
   2.1), GitHub issue templates (bug report, feature request), and a pull
   request template; README now links the security policy and code of conduct.

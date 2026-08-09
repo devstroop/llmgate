@@ -59,6 +59,10 @@ Anthropic client ──▶ /v1/messages ───────┘                
   the request leaves the gateway and restored transparently in the
   response — streaming or not. The upstream provider never sees sensitive
   data; the client never sees tokens. See [Privacy Guard](#privacy-guard).
+- **Observability (M10)** — optional embedded request log: every request is
+  stored as a JSON record (model, protocols, latency, status, token usage)
+  in a single-file nqlite database; queryable offline with `nql-cli`. See
+  [Observability](#observability-m10).
 
 ## Quick start
 
@@ -190,6 +194,35 @@ Scope notes (v1): image blocks are not redacted (no OCR/vision pass), tool
 a request that exhausts the cap is **rejected** (fail closed): the provider
 never receives the unredacted tail. A persistent vault backend (e.g. sqlite)
 is a future extension; the session API is the seam.
+
+## Observability (M10)
+
+When `[memory]` is enabled, the gateway records every request in an embedded
+nqlite database (single file + sidecar WAL): model, client/upstream
+protocols, stream vs non-stream, status, latency, and token usage
+(non-stream responses). Records are written by a background actor — the
+request path never blocks on storage — and the WAL is checkpointed on a
+configurable cadence. Expired records (`ttl_hours`) are swept
+deterministically.
+
+```toml
+[memory]
+enabled = true
+path = "llmgate.nql"        # required when enabled (startup fails otherwise)
+ttl_hours = 0               # 0 = keep forever
+# flush_interval_secs = 30  # WAL checkpoint + TTL sweep cadence
+```
+
+Query the store offline with the nql CLI (from the nqlite workspace):
+
+```bash
+cargo run -p nql-cli --release -- --db llmgate.nql --script \
+  "SELECT * FROM request ORDER BY ::recency LIMIT 20;"
+```
+
+Records carry `request_id` (inbound `x-request-id`), so a request can be
+correlated with its gateway logs. Disabled (`enabled = false` or absent) is
+byte-for-byte passthrough with zero runtime overhead.
 
 ## Project layout
 

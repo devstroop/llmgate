@@ -15,6 +15,10 @@ aho-corasick = "1"
 anyhow = "1"
 axum = "0.8"
 futures-util = "0.3"
+# M10 memory substrate: embedded context store (path deps until the nqlite
+# crates are published — see llmgate-nqlite-scope.md, decision A3).
+nql = { path = "/root/workspace/nqlite/nql" }
+nqlite = { path = "/root/workspace/nqlite/nqlite" }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
