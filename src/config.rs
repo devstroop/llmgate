@@ -36,6 +36,8 @@ pub struct Config {
     /// Reversible redaction (Privacy Guard) settings. Disabled by default.
     #[serde(rename = "privacy_guard")]
     pub privacy: PrivacyConfig,
+    /// Embedded observability store (M10). Disabled by default.
+    pub memory: MemoryConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -102,6 +104,24 @@ pub struct ServerConfig {
     pub port: u16,
 }
 
+/// M10 embedded observability store (nqlite). Disabled by default; when
+/// enabled, every request is logged as a JSON record in the database at
+/// `path`. Fail closed: enabling without a `path` (or an unopenable
+/// database) aborts startup.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryConfig {
+    /// Log request records to the embedded nqlite store.
+    pub enabled: bool,
+    /// Path to the nqlite database file (e.g. "llmgate.nql"). Required when
+    /// `enabled = true`; the parent directory is created if missing.
+    pub path: Option<String>,
+    /// Retention for request records, in hours (0 = keep forever).
+    pub ttl_hours: Option<u64>,
+    /// Seconds between WAL checkpoints and TTL sweeps (default 30).
+    pub flush_interval_secs: Option<u64>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -128,6 +148,7 @@ impl Default for Config {
                 api_keys: Vec::new(),
             },
             privacy: PrivacyConfig::default(),
+            memory: MemoryConfig::default(),
         }
     }
 }
@@ -258,6 +279,18 @@ impl Config {
         for prefix in &self.models.prefixes {
             if prefix.is_empty() {
                 anyhow::bail!("models.prefixes contains an empty string; remove it");
+            }
+        }
+        // M10 memory store: an enabled store without a usable path would
+        // fail at startup anyway (open aborts), but catch the missing-path
+        // config error here with a clear message instead of a confusing
+        // open-database error.
+        if self.memory.enabled {
+            match self.memory.path.as_deref() {
+                Some(p) if !p.trim().is_empty() => {}
+                _ => anyhow::bail!(
+                    "memory.enabled = true requires memory.path (nqlite database file)"
+                ),
             }
         }
         Ok(())
@@ -442,5 +475,35 @@ patterns = ['\bfoo@example\.com\b']
         // An accidentally config-less start must not expose an
         // unauthenticated proxy on all interfaces.
         assert_eq!(Config::default().server.host, "127.0.0.1");
+    }
+
+    #[test]
+    fn memory_enabled_requires_path() {
+        let mut cfg = Config::default();
+        cfg.memory.enabled = true;
+        cfg.memory.path = None;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("memory.path"), "{err}");
+    }
+
+    #[test]
+    fn memory_enabled_with_path_validates() {
+        let mut cfg = Config::default();
+        cfg.memory.enabled = true;
+        cfg.memory.path = Some("llmgate.nql".into());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn memory_unknown_field_rejected() {
+        let dir = std::env::temp_dir();
+        let toml_text = format!(
+            "[server]\nport = 5050\n[memory]\nenabled = true\npath = \"{}\"\nbogus = 1\n",
+            dir.join("cfg-test.nql").to_string_lossy()
+        );
+        let err = toml::from_str::<Config>(&toml_text)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bogus"), "{err}");
     }
 }
