@@ -7,6 +7,26 @@ conventions, and review process. It is the same workflow the maintainers use.
 
 Requirements: Rust 1.85+ (edition 2024).
 
+### Windows prerequisites
+
+On Windows the default `x86_64-pc-windows-msvc` target needs `link.exe`.
+`cargo build` will fail with `linker 'link.exe' not found` if the MSVC
+toolchain is absent ([issue #12](https://github.com/devstroop/llmgate/issues/12)).
+
+**Option A — MSVC (recommended):**
+Install *Build Tools for Visual Studio* 2022 with **Desktop development with C++**:
+
+```powershell
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+where link.exe
+rustc --version --verbose  # host: x86_64-pc-windows-msvc
+```
+
+**Option B — GNU (no VS):** `rustup toolchain install stable-x86_64-pc-windows-gnu`
+and use MinGW/MSYS2. See https://rust-lang.github.io/rustup/installation/windows-msvc.html.
+
+Diagnostics: `rustc --version --verbose | findstr host`, `rustup show`, `where link.exe`.
+
 ```bash
 cargo build
 cargo test
@@ -15,7 +35,12 @@ cargo fmt --check
 ```
 
 All four must pass before a PR is ready. The CI workflow
-(`.github/workflows/ci.yml`) runs the same gates on every push.
+(`.github/workflows/ci.yml`) runs the same gates on every push
+(`fmt+clippy` on `ubuntu-latest`; `cargo test` on `ubuntu` + `windows` +
+`macos`; MSRV 1.85). The release workflow (`.github/workflows/release.yml`)
+triggers after CI succeeds on `main` and builds the full platform matrix
+(`x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`,
+`x86_64-apple-darwin`, `aarch64-apple-darwin`).
 
 ## Branch model
 
