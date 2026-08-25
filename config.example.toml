@@ -73,3 +73,21 @@ vault = "memory"
 # [privacy_guard.allow_list]
 # domains = ["devstroop.com"]           # emails/URLs on these domains pass through
 # patterns = ['\bfoo@example\.com\b']   # regex-exempt matches
+
+[memory]
+# M10 embedded observability store (nqlite, single file + WAL). Disabled by
+# default. When enabled, every request is logged as a JSON record (model,
+# protocols, latency, status, token usage) in the database at `path`.
+enabled = false
+# Path to the nqlite database file. Required when enabled = true (startup
+# fails otherwise — fail closed). The parent directory is created if missing.
+# path = "llmgate.nql"
+# Retention for request records in hours (0 = keep forever). Expired
+# records are FORGETten on the flush cadence.
+# ttl_hours = 0
+# Seconds between WAL checkpoints and TTL sweeps (default 30).
+# flush_interval_secs = 30
+
+# Query the store offline with the nql CLI (from the nqlite workspace):
+#   cargo run -p nql-cli --release -- --db llmgate.nql \
+#     --script "SELECT * FROM request ORDER BY ::recency LIMIT 20;"

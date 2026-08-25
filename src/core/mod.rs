@@ -1,6 +1,7 @@
 // Protocol-agnostic core: neutral model, adapter traits, registry, pipeline.
 
 pub mod error;
+pub mod memory;
 pub mod neutral;
 pub mod pipeline;
 pub mod privacy;

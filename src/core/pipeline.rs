@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
@@ -7,6 +7,7 @@ use axum::response::Response as AxumResponse;
 use futures_util::{Stream, StreamExt};
 
 use super::error::AdapterError;
+use super::memory::{MemoryStore, RequestRecord};
 use super::neutral::{ContentBlock, NeutralResponse, NeutralStreamEvent};
 use super::privacy::{RedactionEngine, RedactionSession, StreamRestorer};
 use super::registry::{ProtocolAdapter, ProtocolRegistry};
@@ -32,6 +33,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// Compiled privacy guard engine; `None` when the feature is disabled.
     pub privacy: Option<Arc<RedactionEngine>>,
+    /// M10 embedded observability store; `None` when `[memory]` is disabled.
+    pub memory: Option<Arc<MemoryStore>>,
 }
 
 impl AppState {
@@ -45,6 +48,13 @@ impl AppState {
         } else {
             None
         };
+        // M10: the embedded store opens its database and spawns the writer
+        // actor here; failure aborts startup (fail closed).
+        let memory = if config.memory.enabled {
+            Some(Arc::new(MemoryStore::start(&config.memory)?))
+        } else {
+            None
+        };
         Ok(Self {
             resolver: ModelResolver::new(
                 config.models.default.clone(),
@@ -55,7 +65,67 @@ impl AppState {
             http,
             config,
             privacy,
+            memory,
         })
+    }
+}
+
+/// M10 record context captured per request (built only when `[memory]` is
+/// enabled). Cheap enough to construct unconditionally.
+#[derive(Clone)]
+struct MemCtx {
+    request_id: String,
+    client: String,
+    upstream: String,
+    model: String,
+    started: Instant,
+}
+
+impl MemCtx {
+    /// Capture the inbound `x-request-id` (or "-") before the body is
+    /// consumed. `client`/`upstream` are adapter names; `model` must be set
+    /// after resolution.
+    fn capture(client: &str, upstream: &str, request: &Request<Body>) -> Self {
+        let request_id = request
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("-")
+            .to_string();
+        Self {
+            request_id,
+            client: client.to_string(),
+            upstream: upstream.to_string(),
+            model: String::new(),
+            started: Instant::now(),
+        }
+    }
+
+    fn to_record(
+        &self,
+        mode: &'static str,
+        status: &'static str,
+        usage: Option<(u64, u64)>,
+    ) -> RequestRecord {
+        RequestRecord {
+            request_id: self.request_id.clone(),
+            client: self.client.clone(),
+            upstream: self.upstream.clone(),
+            model: self.model.clone(),
+            mode,
+            status,
+            latency_ms: self.started.elapsed().as_millis() as u64,
+            input_tokens: usage.map(|u| u.0),
+            output_tokens: usage.map(|u| u.1),
+        }
+    }
+}
+
+/// Record a request outcome when the memory store is enabled.
+fn mem_record(state: &AppState, ctx: &MemCtx, mode: &'static str, status: &'static str) {
+    if let Some(m) = &state.memory {
+        m.record(ctx.to_record(mode, status, None));
     }
 }
 
@@ -90,6 +160,8 @@ pub async fn handle_conversation(
         }
     };
 
+    let mut mem_ctx = MemCtx::capture(client.name(), upstream.name(), &request);
+
     let body = match read_body(request).await {
         Ok(b) => b,
         Err(e) => return error_json_response(client.serialize_error(&e)),
@@ -101,6 +173,7 @@ pub async fn handle_conversation(
     };
 
     neutral.model = state.resolver.resolve(&neutral.model);
+    mem_ctx.model = neutral.model.clone();
     let stream = neutral.stream;
 
     // Privacy Guard: reversibly redact the request before it leaves the
@@ -159,6 +232,7 @@ pub async fn handle_conversation(
         match proxy::forward_stream(&state.http, &url, &headers, &upstream_body).await {
             Ok(r) => r,
             Err(e) => {
+                mem_record(&state, &mem_ctx, "stream", "error");
                 let err = AdapterError::Internal(format!("upstream request failed: {e}"));
                 return error_json_response(client.serialize_error(&err));
             }
@@ -168,6 +242,7 @@ pub async fn handle_conversation(
         match proxy::forward(&state.http, &url, &headers, &upstream_body, timeout).await {
             Ok(r) => r,
             Err(e) => {
+                mem_record(&state, &mem_ctx, "non-stream", "error");
                 let err = AdapterError::Internal(format!("upstream request failed: {e}"));
                 return error_json_response(client.serialize_error(&err));
             }
@@ -175,7 +250,15 @@ pub async fn handle_conversation(
     };
 
     if stream {
-        return handle_streaming_response(client, upstream, resp, privacy_session).await;
+        return handle_streaming_response(
+            client,
+            upstream,
+            resp,
+            privacy_session,
+            state.memory.clone(),
+            mem_ctx,
+        )
+        .await;
     }
 
     let status = resp.status();
@@ -192,17 +275,28 @@ pub async fn handle_conversation(
         if let Some(session) = &privacy_session {
             error_body = session.restore_text(&error_body);
         }
+        mem_record(&state, &mem_ctx, "non-stream", "error");
         let err = upstream.parse_upstream_error(status.as_u16(), &error_body);
         return error_json_response(client.serialize_error(&err));
     }
 
     let mut neutral_resp = match upstream.parse_response(&resp_text) {
         Ok(r) => r,
-        Err(e) => return error_json_response(client.serialize_error(&e)),
+        Err(e) => {
+            mem_record(&state, &mem_ctx, "non-stream", "error");
+            return error_json_response(client.serialize_error(&e));
+        }
     };
 
     if let Some(session) = &privacy_session {
         session.restore_response(&mut neutral_resp);
+    }
+
+    if let Some(m) = &state.memory {
+        let usage = neutral_resp
+            .usage
+            .map(|u| (u.input_tokens, u.output_tokens));
+        m.record(mem_ctx.to_record("non-stream", "ok", usage));
     }
 
     let client_body = match client.serialize_response(&neutral_resp) {
@@ -391,6 +485,8 @@ async fn handle_streaming_response(
     upstream: Arc<dyn ProtocolAdapter>,
     resp: reqwest::Response,
     privacy: Option<Arc<RedactionSession>>,
+    memory: Option<Arc<MemoryStore>>,
+    mem_ctx: MemCtx,
 ) -> AxumResponse {
     let status = resp.status();
     if !status.is_success() {
@@ -403,6 +499,9 @@ async fn handle_streaming_response(
         let mut error_body = resp_text;
         if let Some(session) = &privacy {
             error_body = session.restore_text(&error_body);
+        }
+        if let Some(m) = &memory {
+            m.record(mem_ctx.to_record("stream", "error", None));
         }
         let err = upstream.parse_upstream_error(status.as_u16(), &error_body);
         return error_json_response(client.serialize_error(&err));
@@ -451,6 +550,9 @@ async fn handle_streaming_response(
         // Set when an Error event was encoded and delivered: also suppress
         // the terminal marker after an explicit upstream error.
         let mut saw_error_event = false;
+        // Set when the client disconnected mid-stream (receiver dropped):
+        // the observable outcome is a truncated stream, not a success.
+        let mut client_gone = false;
         let mut stream = Box::pin(upstream_stream);
         while running {
             // No total timeout (long SSE streams must not be cut off), but
@@ -461,6 +563,7 @@ async fn handle_streaming_response(
             tokio::select! {
                 _ = tx.closed() => {
                     running = false;
+                    client_gone = true;
                 }
                 chunk = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()) => {
                     match chunk {
@@ -577,6 +680,16 @@ async fn handle_streaming_response(
                 if !saw_error_event {
                     let _ = tx.send(Ok(axum::body::Bytes::from(encoder.done()))).await;
                 }
+            }
+            // M10: record the stream outcome. Token usage is not captured
+            // for streams in M10 (see PLAN.md).
+            if let Some(m) = &memory {
+                let status = if upstream_failed || saw_error_event || client_gone {
+                    "error"
+                } else {
+                    "ok"
+                };
+                m.record(mem_ctx.to_record("stream", status, None));
             }
         }
     });
