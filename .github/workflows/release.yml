@@ -1,0 +1,195 @@
+name: Release
+
+# Build release binaries for every target in the matrix and, on tags,
+# publish a GitHub Release with checksums. The matrix is the source of
+# truth for supported platforms — keep it in sync with README/Cargo.toml.
+#
+# Triggers:
+#  - push to tags `v*`  → build + publish release
+#  - workflow_run after CI succeeds on `main` → build only (smoke matrix)
+#  - workflow_dispatch → build only (manual matrix verification)
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  push:
+    tags:
+      - "v*.*.*"
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (e.g., 0.1.0) — used as artifact suffix when not a tag"
+        required: false
+        default: ""
+
+permissions:
+  contents: write  # needed to create GitHub Releases + upload assets
+  actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Guard: when triggered by `workflow_run`, only proceed if CI succeeded.
+  # `push` tag and `workflow_dispatch` always proceed.
+  guard:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Trigger ${{ github.event_name }} ok — proceeding to matrix build"
+
+  build:
+    needs: guard
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: llmgate
+            archive: llmgate-x86_64-unknown-linux-gnu.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: llmgate.exe
+            archive: llmgate-x86_64-pc-windows-msvc.zip
+          - os: macos-13
+            target: x86_64-apple-darwin
+            bin: llmgate
+            archive: llmgate-x86_64-apple-darwin.tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            bin: llmgate
+            archive: llmgate-aarch64-apple-darwin.tar.gz
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable, target ${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+          save-if: ${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
+
+      - name: Build release (locked, target ${{ matrix.target }})
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Smoke check binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          ls -lh "$BIN"
+          # `llmgate --help` / `--version` would need a system binary flag;
+          # at minimum ensure the file is executable and not empty.
+          test -s "$BIN"
+          if [[ "${{ matrix.os }}" != "windows-latest" ]]; then
+            file "$BIN" || true
+          fi
+
+      - name: Package archive (unix tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          STAGE="dist/${{ matrix.target }}"
+          mkdir -p "$STAGE"
+          cp "$BIN" "$STAGE/"
+          cp README.md LICENSE config.example.toml "$STAGE/" 2>/dev/null || true
+          tar -czf "${{ matrix.archive }}" -C dist "${{ matrix.target }}"
+          ls -lh "${{ matrix.archive }}"
+          shasum -a 256 "${{ matrix.archive }}" | tee "${{ matrix.archive }}.sha256"
+          cat "${{ matrix.archive }}.sha256"
+
+      - name: Package archive (windows zip + sha256)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bin = "target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          $stage = "dist/${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item $bin "$stage/"
+          Copy-Item README.md "$stage/" -ErrorAction SilentlyContinue
+          Copy-Item LICENSE "$stage/" -ErrorAction SilentlyContinue
+          Copy-Item config.example.toml "$stage/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$stage/*" -DestinationPath "${{ matrix.archive }}" -Force
+          Get-ChildItem "${{ matrix.archive }}"
+          $hash = (Get-FileHash "${{ matrix.archive }}" -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${{ matrix.archive }}" | Out-File -Encoding ascii "${{ matrix.archive }}.sha256"
+          Get-Content "${{ matrix.archive }}.sha256"
+
+      - name: Upload artifact (binary + archive + checksum)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}
+            ${{ matrix.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  # Aggregate checksums and, on tag pushes, create the GitHub Release.
+  publish:
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: false
+
+      - name: Collect archives for release
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -R artifacts
+          mkdir -p release
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.sha256" \) -exec cp -t release {} +
+          ls -lh release
+          # Combined checksum file across all platform archives (excluding per-archive .sha256 sidecars)
+          (cd release && sha256sum *.tar.gz *.zip 2>/dev/null | tee SHA256SUMS || true)
+          cat release/SHA256SUMS || echo "no SHA256SUMS generated (no archives?)"
+          echo "Artifacts staged for release"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.tar.gz
+            release/*.zip
+            release/*.sha256
+            release/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          draft: false
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Optional smoke summary when triggered via workflow_run / dispatch (no release)
+  summary:
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Matrix build complete — all platforms green. Tag push (v*) will trigger a GitHub Release with archives + SHA256SUMS."

@@ -68,6 +68,48 @@ Anthropic client ──▶ /v1/messages ───────┘                
 
 Requirements: Rust 1.85+ (edition 2024).
 
+### Windows prerequisites
+
+On Windows the default target `x86_64-pc-windows-msvc` requires the MSVC
+linker `link.exe`. Without it `cargo build` fails with `linker 'link.exe'
+not found` ([issue #12](https://github.com/devstroop/llmgate/issues/12)).
+
+**Option A — MSVC (recommended):** install *Build Tools for Visual Studio*
+2022 with the **Desktop development with C++** workload (free, no VS Code
+— `VS Code is not sufficient` per the compiler note):
+
+```powershell
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+# reopen terminal, then verify:
+where link.exe
+rustc --version --verbose  # should show host: x86_64-pc-windows-msvc
+cargo build --release
+```
+
+**Option B — GNU (no VS):** use the `gnu` toolchain + MinGW:
+
+```powershell
+rustup toolchain install stable-x86_64-pc-windows-gnu
+rustup default stable-x86_64-pc-windows-gnu
+# install MinGW via https://www.msys2.org/ or `winget install MSYS2.MSYS2`
+cargo build --release
+```
+
+Diagnostics if the build still fails:
+
+```powershell
+rustc --version --verbose | findstr host
+rustup show
+where link.exe   # only for MSVC target
+```
+
+See https://rust-lang.github.io/rustup/installation/windows-msvc.html.
+CI builds on `ubuntu-latest`, `windows-latest`, and `macos-latest`
+(`.github/workflows/ci.yml`) and release builds ship for all four
+targets in the matrix (`x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`,
+`x86_64-apple-darwin`, `aarch64-apple-darwin`) via
+`.github/workflows/release.yml`.
+
 ```bash
 cargo build --release
 

@@ -497,9 +497,13 @@ patterns = ['\bfoo@example\.com\b']
     #[test]
     fn memory_unknown_field_rejected() {
         let dir = std::env::temp_dir();
+        // Use TOML literal string (single quotes) so Windows backslashes are not
+        // interpreted as escapes (\U -> unicode). Forward slashes would also work,
+        // but single quotes are the TOML-native literal.
+        let path = dir.join("cfg-test.nql").to_string_lossy().to_string();
         let toml_text = format!(
-            "[server]\nport = 5050\n[memory]\nenabled = true\npath = \"{}\"\nbogus = 1\n",
-            dir.join("cfg-test.nql").to_string_lossy()
+            "[server]\nport = 5050\n[memory]\nenabled = true\npath = '{}'\nbogus = 1\n",
+            path.replace('\'', "''")
         );
         let err = toml::from_str::<Config>(&toml_text)
             .unwrap_err()
